@@ -1,0 +1,41 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Add an ESPaper display",
+        "description": "Pick the panel to control. It only advertises for a couple of seconds every minute, so it may take a moment to appear.",
+        "data": {
+          "address": "Bluetooth device"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Set up {name}",
+        "description": "Add {name}? A text entity will be created; whatever Markdown you put in it is rendered and uploaded the next time the panel wakes."
+      }
+    },
+    "abort": {
+      "already_configured": "This display is already configured.",
+      "no_devices_found": "No ESPaper displays have been seen yet. The panel advertises for about two seconds a minute, so wait a moment and try again."
+    }
+  },
+  "entity": {
+    "text": {
+      "markdown": {
+        "name": "Markdown"
+      }
+    }
+  },
+  "services": {
+    "set_markdown": {
+      "name": "Set Markdown",
+      "description": "Set the Markdown shown on the panel. Unlike the text entity this has no 255-character limit.",
+      "fields": {
+        "markdown": {
+          "name": "Markdown",
+          "description": "Markdown to render. Supports headings, bullet and numbered lists, bold, code spans, block quotes and horizontal rules."
+        }
+      }
+    }
+  }
+}

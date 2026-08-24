@@ -1,0 +1,19 @@
+{
+  "domain": "espaper",
+  "name": "ESPaper Uploader",
+  "bluetooth": [
+    {
+      "service_uuid": "69770000-b271-453a-a64d-cb31cec14bee",
+      "connectable": true
+    }
+  ],
+  "codeowners": ["@n0n3m4"],
+  "config_flow": true,
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://github.com/n0n3m4/espaper-uploader",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/n0n3m4/espaper-uploader/issues",
+  "requirements": ["bleak-retry-connector>=3.5.0", "Pillow>=10.1.0"],
+  "version": "0.1.0"
+}

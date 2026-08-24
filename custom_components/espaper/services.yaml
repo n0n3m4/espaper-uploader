@@ -1,0 +1,12 @@
+set_markdown:
+  target:
+    entity:
+      integration: espaper
+      domain: text
+  fields:
+    markdown:
+      required: true
+      example: "# Shopping\n\n- Milk\n- **Eggs**"
+      selector:
+        text:
+          multiline: true
