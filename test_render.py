@@ -9,10 +9,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "custom_components" / "espaper"))
 
-from render import pack_1bpp, render_image, render_markdown, unpack_1bpp  # noqa: E402
+from render import (  # noqa: E402
+    pack_1bpp,
+    pack_2bpp,
+    quantize_gray4,
+    render_canvas,
+    render_image,
+    render_markdown,
+    unpack_1bpp,
+    unpack_2bpp,
+)
 
 SIZE = (400, 300)
 EXPECTED = (SIZE[0] + 7) // 8 * SIZE[1]  # 15000 bytes
+EXPECTED_GRAY4 = SIZE[0] // 4 * SIZE[1]  # 30000 bytes
 
 SAMPLE = """# Shopping
 
@@ -41,8 +51,33 @@ def test_roundtrip():
     assert unpack_1bpp(pack_1bpp(image), SIZE).tobytes() == image.tobytes()
 
 
+def test_gray4_payload_geometry():
+    payload = render_markdown(SAMPLE, SIZE, gray4=True)
+    assert len(payload) == EXPECTED_GRAY4, len(payload)
+    assert any(payload), "frame is entirely white"
+
+
+def test_gray4_is_actually_antialiased():
+    # The point of 4 colours: glyph edges keep the greys the renderer drew,
+    # rather than being thresholded away. If someone reinstates a threshold on
+    # this path, only two levels survive and this fails.
+    levels = quantize_gray4(render_canvas(SAMPLE, SIZE))
+    assert set(levels) == {0, 1, 2, 3}, sorted(set(levels))
+
+
+def test_gray4_roundtrip():
+    levels = quantize_gray4(render_canvas(SAMPLE, SIZE))
+    assert max(levels) <= 3
+    painted = unpack_2bpp(pack_2bpp(levels), SIZE)
+    # Every pixel comes back as the luminance its level stands for.
+    assert len(painted.tobytes()) == SIZE[0] * SIZE[1]
+    assert quantize_gray4(painted) == levels
+
+
 def test_empty_is_blank():
     assert render_markdown("", SIZE) == b"\x00" * EXPECTED
+    # Level 0 is white, so a blank 4-colour frame is zeroes too.
+    assert render_markdown("", SIZE, gray4=True) == b"\x00" * EXPECTED_GRAY4
 
 
 def test_overflow_is_clipped():

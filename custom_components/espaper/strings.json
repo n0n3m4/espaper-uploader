@@ -20,6 +20,11 @@
     }
   },
   "entity": {
+    "switch": {
+      "gray4": {
+        "name": "4 colours"
+      }
+    },
     "text": {
       "markdown": {
         "name": "Markdown"

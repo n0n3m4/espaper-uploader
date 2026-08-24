@@ -3,7 +3,8 @@
 No Home Assistant imports, so it can be exercised standalone against a real
 board:
 
-    python epaper.py notes.md
+    python epaper.py notes.md            # 4 colours, as the integration sends
+    python epaper.py notes.md --mono     # black and white
 
 Ported from ``tools/epaper_push.py`` in the firmware repo. The wire protocol,
 the status codes and the chunking are unchanged; what is different is the
@@ -59,8 +60,10 @@ ERROR_NAMES = {
 }
 STATE_DONE, STATE_ERROR = 4, 5
 
-# BEGIN flags. Bit 0 would invert the bit convention and bit 1 selects 2bpp;
-# this client uses neither. Bit 2 says the payload is a zlib stream.
+# BEGIN flags. Bit 0 would invert the bit convention, which this client never
+# does; bit 1 selects 2bpp (4 grey levels, 30000 bytes instead of 15000) and
+# bit 2 says the payload is a zlib stream. Both are decided per frame.
+FLAG_GRAY4 = 1 << 1
 FLAG_DEFLATE = 1 << 2
 
 # Largest ATT payload NimBLE will accept (MTU 256 minus the 3-byte write
@@ -110,13 +113,15 @@ class _StatusTracker:
         )
 
 
-def _build_begin(width: int, height: int, length: int, crc: int, deflate: bool) -> bytes:
+def _build_begin(
+    width: int, height: int, length: int, crc: int, gray4: bool, deflate: bool
+) -> bytes:
     return struct.pack(
         "<B4sBBHHII",
         OP_BEGIN,
         MAGIC,
         PROTOCOL_VERSION,
-        FLAG_DEFLATE if deflate else 0,
+        (FLAG_GRAY4 if gray4 else 0) | (FLAG_DEFLATE if deflate else 0),
         width,
         height,
         length,
@@ -142,29 +147,41 @@ class EPaperDisplay:
         self.address = address
 
     async def push(
-        self, device: BLEDevice, payload_for: Callable[[int, int], bytes]
+        self,
+        device: BLEDevice,
+        payload_for: Callable[[int, int, bool], bytes],
+        gray4: bool = False,
     ) -> None:
         """Connect, render to the panel's real geometry, upload, and commit.
 
-        ``payload_for(width, height)`` is only called once INFO has been read,
-        so the firmware -- not this client -- stays the authority on panel
-        size. Raises :class:`EPaperError` unless the device reports DONE.
+        ``payload_for(width, height, gray4)`` is only called once INFO has been
+        read, so the firmware -- not this client -- stays the authority on both
+        panel size and colour depth: a board that advertises 1 bpp gets a 1bpp
+        frame however this was called. Raises :class:`EPaperError` unless the
+        device reports DONE.
         """
         client = await establish_connection(
             BleakClientWithServiceCache, device, self.address
         )
         try:
-            width, height, sleep_s = await self._read_info(client)
+            width, height, bpp, sleep_s = await self._read_info(client)
             _LOGGER.debug(
-                "espaper %s: panel %dx%d, sleeps %ds between adverts",
+                "espaper %s: panel %dx%d, %d bpp, sleeps %ds between adverts",
                 self.address,
                 width,
                 height,
+                bpp,
                 sleep_s,
             )
+            if gray4 and bpp < 2:
+                _LOGGER.info(
+                    "espaper %s: panel advertises 1 bpp, sending black and white",
+                    self.address,
+                )
+                gray4 = False
 
-            payload = payload_for(width, height)
-            expected = (width + 7) // 8 * height
+            payload = payload_for(width, height, gray4)
+            expected = width // 4 * height if gray4 else (width + 7) // 8 * height
             if len(payload) != expected:
                 raise EPaperError(
                     f"rendered {len(payload)} bytes, panel wants {expected}"
@@ -172,7 +189,7 @@ class EPaperDisplay:
 
             status = _StatusTracker()
             await client.start_notify(CHR_STATUS, status.handle)
-            await self._send(client, status, width, height, payload)
+            await self._send(client, status, width, height, payload, gray4)
 
             try:
                 await asyncio.wait_for(status.terminal.wait(), RENDER_TIMEOUT)
@@ -190,7 +207,7 @@ class EPaperDisplay:
 
     async def _read_info(
         self, client: BleakClientWithServiceCache
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int]:
         raw = await client.read_gatt_char(CHR_INFO)
         if len(raw) < 8:
             raise EPaperError(f"INFO characteristic too short: {len(raw)} bytes")
@@ -200,9 +217,9 @@ class EPaperDisplay:
                 f"device speaks protocol v{version}, this client speaks "
                 f"v{PROTOCOL_VERSION}"
             )
-        if bpp != 1:
-            raise EPaperError(f"device reports {bpp} bpp, only 1 bpp is supported")
-        return width, height, sleep_s
+        if bpp not in (1, 2):
+            raise EPaperError(f"device reports {bpp} bpp, which this client cannot pack")
+        return width, height, bpp, sleep_s
 
     async def _send(
         self,
@@ -211,6 +228,7 @@ class EPaperDisplay:
         width: int,
         height: int,
         payload: bytes,
+        gray4: bool = False,
     ) -> None:
         # A page of rendered text deflates to roughly a sixth of a frame, which
         # is a sixth of the chunks and of the awake burst that dominates the
@@ -225,10 +243,12 @@ class EPaperDisplay:
         crc = zlib.crc32(payload) & 0xFFFFFFFF
         chunk = _chunk_size(client)
         _LOGGER.debug(
-            "espaper %s: sending %d of %d bytes (deflate=%s), crc32=0x%08x, chunk=%d",
+            "espaper %s: sending %d of %d bytes (%d colours, deflate=%s), "
+            "crc32=0x%08x, chunk=%d",
             self.address,
             len(payload),
             raw,
+            4 if gray4 else 2,
             deflate,
             crc,
             chunk,
@@ -237,7 +257,7 @@ class EPaperDisplay:
         status.updated.clear()
         await client.write_gatt_char(
             CHR_CTRL,
-            _build_begin(width, height, len(payload), crc, deflate),
+            _build_begin(width, height, len(payload), crc, gray4, deflate),
             response=True,
         )
         # The device acks the header with a status notification; if it rejected
@@ -269,7 +289,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     async def _main() -> int:
-        text = Path(sys.argv[1]).read_text() if len(sys.argv) > 1 else "# Hello"
+        args = [a for a in sys.argv[1:] if a != "--mono"]
+        gray4 = "--mono" not in sys.argv
+        text = Path(args[0]).read_text() if args else "# Hello"
         # The board advertises for ~2 s per minute, so scan for a full cycle.
         device = await BleakScanner.find_device_by_filter(
             lambda _d, adv: SVC_UUID.lower() in [u.lower() for u in adv.service_uuids],
@@ -279,7 +301,7 @@ if __name__ == "__main__":
             print("device not found", file=sys.stderr)
             return 1
         await EPaperDisplay(device.address).push(
-            device, lambda w, h: render_markdown(text, (w, h))
+            device, lambda w, h, g: render_markdown(text, (w, h), g), gray4
         )
         return 0
 

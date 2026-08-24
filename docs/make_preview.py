@@ -5,9 +5,11 @@
 
 The panel is rendered at its native 400x300 and then doubled with nearest
 neighbour, so the README image stays pixel-crisp on a high-DPI screen instead
-of being smoothed by the browser. It is set into a grey bezel because a bare
-1bpp frame is pure white: on GitHub's dark theme that reads as an unbounded
-white slab, and on the light theme it has no edge at all.
+of being smoothed by the browser. It goes through the wire format and back so
+that what is shown is the quantised 4-colour frame -- the measured grey levels,
+not the smooth canvas. It is set into a grey bezel because a mostly-white frame
+on GitHub's dark theme reads as an unbounded white slab, and on the light theme
+has no edge at all.
 """
 
 import sys
@@ -17,7 +19,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "custom_components" / "espaper"))
 
-from render import render_image  # noqa: E402
+from render import render_markdown, unpack_2bpp  # noqa: E402
 
 SCALE = 2
 BEZEL = 18 * SCALE
@@ -27,8 +29,9 @@ BEZEL_COLOUR = (58, 58, 60)
 
 def main() -> None:
     here = Path(__file__).parent
-    panel = render_image((here / "sample.md").read_text(), (400, 300))
-    panel = panel.convert("L").resize(
+    frame = render_markdown((here / "sample.md").read_text(), (400, 300), gray4=True)
+    panel = unpack_2bpp(frame, (400, 300))
+    panel = panel.resize(
         (panel.width * SCALE, panel.height * SCALE), Image.NEAREST
     )
 

@@ -1,4 +1,4 @@
-"""Render a small Markdown subset to a 1bpp e-paper frame.
+"""Render a small Markdown subset to an e-paper frame, 1bpp or 4-colour.
 
 No Home Assistant imports: run it directly to preview a layout.
 
@@ -7,15 +7,22 @@ No Home Assistant imports: run it directly to preview a layout.
 Only Pillow is needed. A full Markdown library would hand back an AST and
 leave the entire layout pass still to write, so the subset is parsed inline.
 
-Everything here is tuned for a 1bpp panel rather than a screen:
+Layout happens once, on a greyscale canvas; only the last step differs
+between the two depths. The panel has four levels, so the antialiased canvas
+can be quantised straight onto them (`render_markdown(..., gray4=True)`, the
+integration's default) and glyph edges survive as grey. Squeezing the same
+canvas into one bit throws that away, so it compensates.
+
+Everything here is tuned for a small panel rather than a screen:
 
 * the bundled face is Noto Sans SemiCondensed **Medium** -- semicondensed to
   fit more characters per line, Medium because Regular's thin stems drop out
   when antialiased greys get thresholded (Inkycal defaults to it for the same
   reason),
-* text is drawn antialiased on an "L" canvas and thresholded at `INK_CUTOFF`,
-  which is set above mid-grey deliberately: edge pixels that are only slightly
-  grey become ink, thickening stems instead of eroding them,
+* for 1bpp the canvas is thresholded at `INK_CUTOFF`, which is set above
+  mid-grey deliberately: edge pixels that are only slightly grey become ink,
+  thickening stems instead of eroding them. 4-colour needs no such trick --
+  those same edge pixels simply land on a grey level,
 * `code` spans render as white-on-black boxes rather than in a mono face --
   at this size a weight change is invisible but an inverted box is not,
 * structure is drawn rather than spaced: headings get a rule under them and
@@ -35,9 +42,17 @@ FONT_DIR = Path(__file__).parent / "fonts"
 FONT_REGULAR = FONT_DIR / "NotoSans-SemiCondensedMedium.ttf"
 FONT_BOLD = FONT_DIR / "NotoSans-SemiCondensedSemiBold.ttf"
 
-# Grey level at or above which a pixel stays white. Above 128 on purpose: it
-# biases antialiased glyph edges towards ink so small text stays solid.
+# Grey level at or above which a pixel stays white, for 1bpp only. Above 128
+# on purpose: it biases antialiased glyph edges towards ink so small text stays
+# solid.
 INK_CUTOFF = 160
+
+# Luminance of each 2bpp wire level, level 0 first. Measured off the panel with
+# black and white pinned to true black and white; the two greys are nowhere near
+# evenly spaced, which is exactly why quantising has to work against these
+# numbers rather than a linear ramp. Film-specific -- retune here if a later
+# batch of panels measures differently. Same table as tools/epaper_push.py.
+GRAY_LEVELS = (255, 202, 80, 0)
 
 BODY_SIZE = 15
 HEADING_SIZES = {1: 26, 2: 21, 3: 17}
@@ -164,8 +179,8 @@ def _draw_line(draw, x, y, line, size) -> int:
     return height
 
 
-def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
-    """Render Markdown to a mode-"1" image of exactly ``size``."""
+def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
+    """Render Markdown to an antialiased mode-"L" image of exactly ``size``."""
     width, height = size
     canvas = Image.new("L", size, 255)
     draw = ImageDraw.Draw(canvas)
@@ -260,7 +275,28 @@ def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
         draw.rectangle((x0 - 4, bottom - BODY_SIZE - 2, width, height), fill=255)
         draw.text((x0, bottom - BODY_SIZE), "…", font=font, fill=0)
 
+    return canvas
+
+
+def threshold(canvas: Image.Image) -> Image.Image:
+    """Squeeze a mode-"L" canvas to mode "1" at :data:`INK_CUTOFF`."""
     return canvas.point(lambda v: 255 if v >= INK_CUTOFF else 0, mode="1")
+
+
+def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
+    """Render Markdown to a mode-"1" image of exactly ``size``."""
+    return threshold(render_canvas(text, size))
+
+
+def quantize_gray4(canvas: Image.Image, levels=GRAY_LEVELS) -> bytes:
+    """Map a mode-"L" canvas to one wire level (0..3) per pixel, row-major.
+
+    Nearest level by luminance, with no error diffusion: dithering is for
+    photographs, and on text it would scatter noise through every glyph edge
+    that antialiasing just placed deliberately.
+    """
+    table = [min(range(4), key=lambda i: abs(v - levels[i])) for v in range(256)]
+    return canvas.point(table, mode="L").tobytes()
 
 
 def pack_1bpp(image: Image.Image) -> bytes:
@@ -278,9 +314,35 @@ def unpack_1bpp(packed: bytes, size: tuple[int, int]) -> Image.Image:
     return Image.frombytes("1", size, bytes(b ^ 0xFF for b in packed))
 
 
-def render_markdown(text: str, size: tuple[int, int] = (400, 300)) -> bytes:
+def pack_2bpp(levels: bytes) -> bytes:
+    """Pack one wire level per pixel into 4 pixels per byte, MSB first."""
+    if len(levels) % 4:
+        raise ValueError(f"{len(levels)} pixels is not a whole number of bytes")
+    return bytes(
+        (levels[i] << 6) | (levels[i + 1] << 4) | (levels[i + 2] << 2) | levels[i + 3]
+        for i in range(0, len(levels), 4)
+    )
+
+
+def unpack_2bpp(
+    packed: bytes, size: tuple[int, int], levels=GRAY_LEVELS
+) -> Image.Image:
+    """Inverse of :func:`pack_2bpp`, painted with the measured luminances."""
+    return Image.frombytes(
+        "L",
+        size,
+        bytes(levels[(b >> shift) & 3] for b in packed for shift in (6, 4, 2, 0)),
+    )
+
+
+def render_markdown(
+    text: str, size: tuple[int, int] = (400, 300), gray4: bool = False
+) -> bytes:
     """Render Markdown straight to the payload the firmware expects."""
-    return pack_1bpp(render_image(text, size))
+    canvas = render_canvas(text, size)
+    if gray4:
+        return pack_2bpp(quantize_gray4(canvas))
+    return pack_1bpp(threshold(canvas))
 
 
 if __name__ == "__main__":
@@ -288,5 +350,7 @@ if __name__ == "__main__":
 
     source = Path(sys.argv[1]).read_text() if len(sys.argv) > 1 else "# Hello\n\nWorld"
     out = sys.argv[2] if len(sys.argv) > 2 else "preview.png"
-    render_image(source).save(out)
+    # What the panel really shows: the 4-colour frame, unpacked at its measured
+    # luminances rather than the raw canvas.
+    unpack_2bpp(render_markdown(source, gray4=True), (400, 300)).save(out)
     print(f"wrote {out}")

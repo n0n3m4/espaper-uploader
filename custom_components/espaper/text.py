@@ -8,12 +8,11 @@ import voluptuous as vol
 from homeassistant.components.text import TextEntity, TextMode
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv, entity_platform
-from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import EPaperConfigEntry
-from .const import ATTR_MARKDOWN, DOMAIN, MANUFACTURER, MODEL, SERVICE_SET_MARKDOWN
+from .const import ATTR_MARKDOWN, SERVICE_SET_MARKDOWN
 
 # Home Assistant truncates any entity state at 255 characters, so this is the
 # ceiling for the UI text box. Longer documents go through set_markdown and
@@ -49,13 +48,7 @@ class EPaperText(RestoreEntity, TextEntity):
     def __init__(self, coordinator) -> None:
         self.coordinator = coordinator
         self._attr_unique_id = f"{coordinator.address}_markdown"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.address)},
-            connections={(CONNECTION_BLUETOOTH, coordinator.address)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name=f"{MANUFACTURER} {coordinator.address}",
-        )
+        self._attr_device_info = coordinator.device_info
 
     @property
     def native_value(self) -> str:

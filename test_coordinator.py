@@ -44,10 +44,10 @@ class FakeDisplay:
         self.pushes: list[bytes] = []
         self.fail = False
 
-    async def push(self, device, payload_for):
+    async def push(self, device, payload_for, gray4=False):
         if self.fail:
             raise EPaperError("boom")
-        self.pushes.append(payload_for(400, 300))
+        self.pushes.append(payload_for(400, 300, gray4))
 
 
 def build() -> tuple[EPaperCoordinator, FakeDisplay]:
@@ -151,10 +151,10 @@ async def test_edit_during_upload_is_not_lost():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_push(device, payload_for):
+    async def slow_push(device, payload_for, gray4=False):
         started.set()
         await release.wait()
-        display.pushes.append(payload_for(400, 300))
+        display.pushes.append(payload_for(400, 300, gray4))
 
     coordinator.display.push = slow_push
     await coordinator.async_set_markdown("first")
@@ -185,6 +185,62 @@ async def test_restore_after_restart_does_not_reupload():
     assert coordinator.status == STATUS_IDLE
 
 
+async def test_colour_switch_repaints():
+    # Toggling the depth must send the same text again, in the other depth:
+    # the panel is holding a frame that no longer matches the settings.
+    coordinator, display = build()
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert len(display.pushes[0]) == 30000, "4 colours is the default"
+
+    await coordinator.async_set_gray4(False)
+    await settle(coordinator)
+    assert len(display.pushes) == 2
+    assert len(display.pushes[1]) == 15000
+    assert coordinator.status == STATUS_IDLE
+
+    # ...and setting it to what it already is changes nothing.
+    await coordinator.async_set_gray4(False)
+    await settle(coordinator)
+    assert len(display.pushes) == 2
+
+
+async def test_colour_switch_during_upload_is_not_lost():
+    # The mirror of test_edit_during_upload_is_not_lost: the latch has to key
+    # on the depth as well as the text, or a mid-upload toggle is swallowed.
+    coordinator, display = build()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_push(device, payload_for, gray4=False):
+        started.set()
+        await release.wait()
+        display.pushes.append(payload_for(400, 300, gray4))
+
+    coordinator.display.push = slow_push
+    await coordinator.async_set_markdown("# Hello")
+    await started.wait()
+    await coordinator.async_set_gray4(False)
+    release.set()
+    coordinator.display.push = FakeDisplay.push.__get__(display)
+    await settle(coordinator)
+    assert len(display.pushes) == 2, "the toggle was dropped"
+    assert len(display.pushes[-1]) == 15000
+    assert coordinator.status == STATUS_IDLE
+
+
+async def test_restored_colour_does_not_reupload():
+    # E-paper holds its image, so a restart must not repaint a panel that is
+    # already showing the right frame in the right depth.
+    coordinator, display = build()
+    coordinator.async_restore_gray4(False)
+    coordinator.async_restore("# Hello", "# Hello")
+    await settle(coordinator)
+    assert coordinator.status == STATUS_IDLE
+    assert not display.pushes
+    assert coordinator.gray4 is False
+
+
 async def test_escaped_newlines_reach_the_panel():
     # The single-line text box cannot hold a real newline, so a typed "\n"
     # has to render as one -- otherwise every heading and bullet is impossible
@@ -192,7 +248,9 @@ async def test_escaped_newlines_reach_the_panel():
     coordinator, display = build()
     await coordinator.async_set_markdown("# Title\\n\\n- one\\n- two")
     await settle(coordinator)
-    assert display.pushes[0] == render_markdown("# Title\n\n- one\n- two", (400, 300))
+    assert display.pushes[0] == render_markdown(
+        "# Title\n\n- one\n- two", (400, 300), gray4=True
+    )
     # ...but the entity keeps showing what was typed, so editing round-trips.
     assert coordinator.markdown == "# Title\\n\\n- one\\n- two"
 

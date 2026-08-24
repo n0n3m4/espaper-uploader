@@ -3,9 +3,9 @@
 A Home Assistant integration for the [BLE e-paper display](../README.md): an
 ESP32-H2 driving a 400×300 monochrome panel.
 
-You get a **text entity** and a **dashboard card**. Put Markdown in either, and
-the integration renders it to a 1bpp frame and pushes it to the panel the next
-time the panel wakes up. Once the panel is showing the current text, nothing
+You get a **text entity**, a **dashboard card** and a **switch**. Put Markdown in
+either box, and the integration renders it — antialiased, in the panel's four
+grey levels — and pushes it the next time the panel wakes up. Once the panel is showing the current text, nothing
 further happens — no polling, no reconnecting — until you change the text again.
 
 <p align="center">
@@ -143,9 +143,17 @@ The entity's attributes show `upload_status` (`idle`, `pending`, `uploading`),
 `last_upload`, `last_error`, and `uploaded_markdown` — what the panel is actually
 displaying right now.
 
+### The 4 colours switch
+
+The panel has four levels, not two, so text is drawn antialiased and quantised
+onto them: **on by default**, which is `switch.espaper_4_colours`. Turn it off
+for black and white — hard-edged glyphs, and half the bytes. Either way the
+frame is repainted immediately, and a board whose firmware only reports 1 bpp
+gets black and white whatever the switch says.
+
 ## Supported Markdown
 
-A deliberate subset, chosen for what stays legible on a 400×300 1bpp panel:
+A deliberate subset, chosen for what stays legible on a 400×300 panel:
 
 | Syntax | Rendered as |
 |---|---|
@@ -162,8 +170,8 @@ Text that runs past the bottom of the panel is clipped, and a `…` is drawn in 
 corner so it is obvious something was cut.
 
 There is no italic cut of the bundled font, and a synthetic skew turns to mush
-once thresholded to one bit, so `*italic*` renders as semibold — emphasis is
-shown, just not distinguished from `**bold**`.
+at this size, so `*italic*` renders as semibold — emphasis is shown, just not
+distinguished from `**bold**`.
 
 ## Rendering notes
 
@@ -171,13 +179,20 @@ The font is **Noto Sans SemiCondensed Medium**, bundled from
 [Inkycal](https://github.com/aceinnolab/Inkycal) (SIL Open Font License, see
 `custom_components/espaper/fonts/`). Semicondensed fits noticeably more
 characters per line; *Medium* rather than Regular because Regular's thin stems
-break up when antialiased greys are thresholded to black and white.
+break up in black and white.
 
-Two other things matter more than they look like they should:
+Layout happens once, on an antialiased greyscale canvas; only the last step
+differs between the two depths. Three things matter more than they look like
+they should:
 
-- Glyphs are drawn antialiased on a greyscale canvas and then thresholded at
-  160, not 128. Biasing above mid-grey turns marginal edge pixels into ink,
-  which thickens stems slightly instead of eroding them.
+- In 4 colours the canvas is quantised to the levels the panel actually
+  produces — **255, 202, 80, 0**, measured, and nowhere near evenly spaced.
+  Nearest level per pixel, no dithering: error diffusion is for photographs,
+  and on text it only scatters noise through the edges antialiasing just placed.
+- In black and white the same canvas is thresholded at 160, not 128. Biasing
+  above mid-grey turns marginal edge pixels into ink, which thickens stems
+  slightly instead of eroding them. That compensation is exactly what 4 colours
+  makes unnecessary.
 - Line pitch comes from the *ink* band (`getbbox("Ag")`), not from the font's
   ascent + descent. Noto's built-in line gap is generous, and on a 300 px panel
   that generosity costs about three lines of text.
@@ -206,15 +221,18 @@ A healthy update looks like this:
 
 ```
 espaper AA:BB:...: new markdown set, queueing upload
-espaper AA:BB:...: uploading 96 characters of markdown
-espaper AA:BB:...: panel 400x300, sleeps 60s between adverts
-espaper AA:BB:...: sending 2275 of 15000 bytes (deflate=True), crc32=0x..., chunk=249
-espaper AA:BB:...: state=DONE err=NONE received=2275
+espaper AA:BB:...: uploading 96 characters of markdown in 4 colours
+espaper AA:BB:...: panel 400x300, 2 bpp, sleeps 60s between adverts
+espaper AA:BB:...: sending 3961 of 30000 bytes (4 colours, deflate=True), crc32=0x..., chunk=249
+espaper AA:BB:...: state=DONE err=NONE received=3961
 espaper AA:BB:...: upload confirmed by the panel
 ```
 
-The frame is deflated when that comes out smaller, which for a page of rendered
-text means about a sixth of the bytes and a sixth of the time on air. The panel
+The frame is deflated whenever that comes out smaller — automatically, decided
+per frame, never configured — which for a page of rendered text means well under
+a fifth of the bytes and of the time on air. That is what keeps 4 colours cheap:
+the raw frame doubles to 30000 bytes, but large flat white areas compress, so
+what actually goes over the radio grows far less. The panel
 is only awake ~2 s a minute, so a shorter upload is also a likelier one. The
 firmware inflates it from the ESP32-H2 ROM's copy of miniz; if it ever reports
 `err=INFLATE` the stream passed its CRC but did not decompress, which means the
@@ -230,6 +248,8 @@ Reading the state:
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
 | `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
 | `state=ERROR err=BAD_GEOMETRY` | Firmware and renderer disagree on panel size — file a bug. |
+| `state=ERROR err=BAD_LENGTH` after turning on 4 colours | The firmware predates 2bpp or deflate. Flash the current build, or turn the switch off. |
+| `panel advertises 1 bpp, sending black and white` | Older firmware; harmless, and the switch stays on for when it is updated. |
 | The card is missing from the picker | Open `/espaper/espaper-card.js` in a browser tab. A 404 means the integration never registered it — the log says `dashboard card served at ...` on a good start, and warns if `www/espaper-card.js` is missing from the install. If it serves fine, it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
 | Stuck at `pending` forever | Look for the 30 s retry lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
 

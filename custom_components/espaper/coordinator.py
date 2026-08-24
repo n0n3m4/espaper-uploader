@@ -17,9 +17,11 @@ from bleak.backends.device import BLEDevice
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
+from .const import DOMAIN, MANUFACTURER, MODEL
 from .epaper import EPaperDisplay, EPaperError
 from .render import render_markdown
 
@@ -63,6 +65,10 @@ class EPaperCoordinator:
 
         self.markdown = ""
         self.uploaded_markdown: str | None = None
+        # 4 grey levels rather than pure black and white: the renderer draws
+        # antialiased and the panel can show the greys, so this is the default.
+        self.gray4 = True
+        self.uploaded_gray4: bool | None = None
         self.status = STATUS_IDLE
         self.last_error: str | None = None
         self.last_upload: datetime | None = None
@@ -72,6 +78,17 @@ class EPaperCoordinator:
         self._retry_unsub: Callable[[], None] | None = None
         self._listeners: list[Callable[[], None]] = []
         self._unsubs: list[Callable[[], None]] = []
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """The one device every entity of this entry hangs off."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.address)},
+            connections={(CONNECTION_BLUETOOTH, self.address)},
+            manufacturer=MANUFACTURER,
+            model=MODEL,
+            name=f"{MANUFACTURER} {self.address}",
+        )
 
     # ---------------------------------------------------------------- setup
 
@@ -128,12 +145,37 @@ class EPaperCoordinator:
         self.status = STATUS_IDLE if markdown == uploaded else STATUS_PENDING
         self._maybe_upload()
 
+    @callback
+    def async_restore_gray4(self, gray4: bool) -> None:
+        """Adopt the colour depth recovered from the switch entity.
+
+        Deliberately does not touch the status: the panel is still holding the
+        frame it was sent before the restart, so there is nothing to repaint.
+        The switch and the text entity restore independently, in either order.
+        """
+        self.gray4 = self.uploaded_gray4 = gray4
+
     async def async_set_markdown(self, text: str) -> None:
         """Set the text to display, and try to push it."""
         if text == self.markdown:
             return
         _LOGGER.debug("espaper %s: new markdown set, queueing upload", self.address)
         self.markdown = text
+        self.status = STATUS_PENDING
+        self.last_error = None
+        self._notify()
+        self._maybe_upload()
+
+    async def async_set_gray4(self, gray4: bool) -> None:
+        """Switch between 4 grey levels and black and white, and repaint."""
+        if gray4 == self.gray4:
+            return
+        _LOGGER.debug(
+            "espaper %s: %d colours selected, queueing upload",
+            self.address,
+            4 if gray4 else 2,
+        )
+        self.gray4 = gray4
         self.status = STATUS_PENDING
         self.last_error = None
         self._notify()
@@ -199,7 +241,7 @@ class EPaperCoordinator:
 
     async def _async_upload(self) -> None:
         """One upload attempt for whatever the text says right now."""
-        sending = self.markdown
+        sending, gray4 = self.markdown, self.gray4
         # Ask the bluetooth stack afresh: the cached device may predate an
         # adapter restart, and there may never have been an advertisement
         # callback to seed it in the first place.
@@ -221,15 +263,16 @@ class EPaperCoordinator:
         self.status = STATUS_UPLOADING
         self._notify()
         _LOGGER.debug(
-            "espaper %s: uploading %d characters of markdown",
+            "espaper %s: uploading %d characters of markdown in %d colours",
             self.address,
             len(sending),
+            4 if gray4 else 2,
         )
 
         text = expand_escapes(sending)
         try:
             await self.display.push(
-                device, lambda w, h: render_markdown(text, (w, h))
+                device, lambda w, h, g: render_markdown(text, (w, h), g), gray4
             )
         except (EPaperError, TimeoutError, OSError) as err:
             # Expected while the board is in its ~60 s deep sleep: it is only
@@ -239,11 +282,17 @@ class EPaperCoordinator:
             self.status = STATUS_PENDING
         else:
             self.uploaded_markdown = sending
+            self.uploaded_gray4 = gray4
             self.last_error = None
             self.last_upload = dt_util.utcnow()
-            # Anything typed mid-upload is still owed to the panel; otherwise
-            # this is the latch that stops us connecting on every wake.
-            self.status = STATUS_IDLE if self.markdown == sending else STATUS_PENDING
+            # Anything changed mid-upload -- text or colour depth -- is still
+            # owed to the panel; otherwise this is the latch that stops us
+            # connecting on every wake.
+            self.status = (
+                STATUS_IDLE
+                if (self.markdown, self.gray4) == (sending, gray4)
+                else STATUS_PENDING
+            )
             _LOGGER.debug("espaper %s: upload confirmed by the panel", self.address)
 
         self._notify()
@@ -251,10 +300,10 @@ class EPaperCoordinator:
         # very task, which is still running, and refuse to re-kick.
         self._task = None
         if self.status == STATUS_PENDING:
-            if self.markdown == sending:
+            if (self.markdown, self.gray4) == (sending, gray4):
                 self._schedule_retry()  # failed; try again on the timer
             else:
-                self._maybe_upload()  # edited mid-upload; send the new text now
+                self._maybe_upload()  # edited mid-upload; send the new frame now
 
     @callback
     def _notify(self) -> None:
