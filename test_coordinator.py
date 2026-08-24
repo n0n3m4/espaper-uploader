@@ -241,6 +241,43 @@ async def test_restored_colour_does_not_reupload():
     assert coordinator.gray4 is False
 
 
+async def test_rotation_repaints():
+    coordinator, display = build()
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+
+    await coordinator.async_set_rotation(90)
+    await settle(coordinator)
+    assert len(display.pushes) == 2
+    assert display.pushes[1] == render_markdown(
+        "# Hello", (400, 300), gray4=True, rotation=90
+    )
+    assert coordinator.status == STATUS_IDLE
+
+    # ...and setting it to what it already is changes nothing.
+    await coordinator.async_set_rotation(90)
+    await settle(coordinator)
+    assert len(display.pushes) == 2
+
+
+async def test_restored_rotation_does_not_reupload():
+    coordinator, display = build()
+    coordinator.async_restore("# Hello", "# Hello", 180, 180)
+    await settle(coordinator)
+    assert coordinator.status == STATUS_IDLE
+    assert not display.pushes
+    assert coordinator.rotation == 180
+
+    # ...but a rotation that never reached the panel must still be sent.
+    coordinator, display = build()
+    coordinator.async_restore("# Hello", "# Hello", 90, 0)
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+    assert display.pushes[0] == render_markdown(
+        "# Hello", (400, 300), gray4=True, rotation=90
+    )
+
+
 async def test_escaped_newlines_reach_the_panel():
     # The single-line text box cannot hold a real newline, so a typed "\n"
     # has to render as one -- otherwise every heading and bullet is impossible

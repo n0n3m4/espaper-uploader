@@ -18,6 +18,7 @@
 
 const DOMAIN = "espaper";
 const DEFAULT_ROWS = 10;
+const ROTATIONS = [0, 90, 180, 270];
 
 // `HTMLElement` only exists in a browser. Standing in for it outside one keeps
 // this module importable by test_card.mjs.
@@ -145,11 +146,24 @@ export class ESPaperCard extends Base {
           cursor: pointer;
         }
         button[disabled] { opacity: 0.5; cursor: default; }
+        select {
+          flex: none;
+          padding: 6px;
+          border: 1px solid var(--divider-color);
+          border-radius: 4px;
+          background: transparent;
+          color: var(--primary-text-color);
+          font: inherit;
+          font-size: 13px;
+        }
       </style>
       <ha-card>
         <textarea spellcheck="false"></textarea>
         <div class="footer">
           <div class="status"></div>
+          <select title="Rotation">
+            ${ROTATIONS.map((deg) => `<option value="${deg}">${deg}\u00b0</option>`).join("")}
+          </select>
           <button type="button">Send</button>
         </div>
       </ha-card>
@@ -158,6 +172,7 @@ export class ESPaperCard extends Base {
     this._textarea = this.shadowRoot.querySelector("textarea");
     this._status = this.shadowRoot.querySelector(".status");
     this._button = this.shadowRoot.querySelector("button");
+    this._rotate = this.shadowRoot.querySelector("select");
 
     if (this._config.title) this._card.setAttribute("header", this._config.title);
     this._textarea.rows = this._config.rows;
@@ -175,6 +190,7 @@ export class ESPaperCard extends Base {
       }
     });
     this._button.addEventListener("click", () => this._send());
+    this._rotate.addEventListener("change", () => this._setRotation());
   }
 
   _update() {
@@ -217,9 +233,28 @@ export class ESPaperCard extends Base {
       notes.push(`${attrs.upload_status ?? "idle"} · panel updated ${ago(attrs.last_upload)}`);
     }
 
+    // Rotation lives in Home Assistant, not here: no local draft to protect,
+    // so the dropdown just mirrors the attribute.
+    this._rotate.value = String(attrs.rotation ?? 0);
     this._status.textContent = notes.join(" · ");
     this._status.classList.toggle("error", Boolean(problem));
     this._button.disabled = this._sending || !this._dirty;
+  }
+
+  async _setRotation() {
+    if (!this._hass) return;
+    this._error = null;
+    try {
+      await this._hass.callService(
+        DOMAIN,
+        "set_rotation",
+        { rotation: Number(this._rotate.value) },
+        { entity_id: this._config.entity },
+      );
+    } catch (err) {
+      this._error = err?.message || String(err);
+    }
+    this._paint();
   }
 
   async _send() {

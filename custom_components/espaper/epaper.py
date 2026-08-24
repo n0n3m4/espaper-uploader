@@ -289,8 +289,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     async def _main() -> int:
-        args = [a for a in sys.argv[1:] if a != "--mono"]
-        gray4 = "--mono" not in sys.argv
+        argv = sys.argv[1:]
+        gray4 = "--mono" not in argv
+        rotation = 0
+        if "--rotate" in argv:
+            i = argv.index("--rotate")
+            rotation = int(argv[i + 1])
+            del argv[i : i + 2]
+        args = [a for a in argv if a != "--mono"]
         text = Path(args[0]).read_text() if args else "# Hello"
         # The board advertises for ~2 s per minute, so scan for a full cycle.
         device = await BleakScanner.find_device_by_filter(
@@ -301,7 +307,9 @@ if __name__ == "__main__":
             print("device not found", file=sys.stderr)
             return 1
         await EPaperDisplay(device.address).push(
-            device, lambda w, h, g: render_markdown(text, (w, h), g), gray4
+            device,
+            lambda w, h, g: render_markdown(text, (w, h), g, rotation),
+            gray4,
         )
         return 0
 

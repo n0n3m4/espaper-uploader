@@ -336,10 +336,23 @@ def unpack_2bpp(
 
 
 def render_markdown(
-    text: str, size: tuple[int, int] = (400, 300), gray4: bool = False
+    text: str,
+    size: tuple[int, int] = (400, 300),
+    gray4: bool = False,
+    rotation: int = 0,
 ) -> bytes:
-    """Render Markdown straight to the payload the firmware expects."""
-    canvas = render_canvas(text, size)
+    """Render Markdown straight to the payload the firmware expects.
+
+    ``rotation`` is how far clockwise the text sits on the panel, for a display
+    hung on its side or upside down. The layout runs at the rotated geometry --
+    300x400 for a quarter turn -- and the canvas is turned back to the panel's
+    own 400x300 at the end, so wrapping and margins are computed for the shape
+    the reader actually sees.
+    """
+    width, height = size
+    canvas = render_canvas(text, (height, width) if rotation % 180 else (width, height))
+    if rotation:
+        canvas = canvas.rotate(-rotation, expand=True)
     if gray4:
         return pack_2bpp(quantize_gray4(canvas))
     return pack_1bpp(threshold(canvas))

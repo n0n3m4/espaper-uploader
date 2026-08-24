@@ -74,6 +74,29 @@ def test_gray4_roundtrip():
     assert quantize_gray4(painted) == levels
 
 
+def test_rotation_fills_the_same_frame():
+    # A quarter turn lays out at 300x400 and comes back as a 400x300 frame:
+    # the wire format never changes, only what is drawn into it.
+    for rotation in (0, 90, 180, 270):
+        payload = render_markdown(SAMPLE, SIZE, rotation=rotation)
+        assert len(payload) == EXPECTED, (rotation, len(payload))
+        assert any(payload), f"{rotation} deg is entirely white"
+    assert render_markdown(SAMPLE, SIZE, rotation=90) != render_markdown(SAMPLE, SIZE)
+    assert len(render_markdown(SAMPLE, SIZE, gray4=True, rotation=270)) == EXPECTED_GRAY4
+
+
+def test_rotation_turns_the_right_way():
+    # 90 is clockwise, so the top-left of the upright layout -- where the
+    # heading sits -- must end up in the top-right.
+    def quadrant_ink(rotation, box):
+        image = unpack_1bpp(render_markdown("# Hi", SIZE, rotation=rotation), SIZE)
+        return sum(1 for v in image.crop(box).convert("L").tobytes() if v == 0)
+
+    top_left, top_right = (0, 0, 200, 150), (200, 0, 400, 150)
+    assert quadrant_ink(0, top_left) > quadrant_ink(0, top_right)
+    assert quadrant_ink(90, top_right) > quadrant_ink(90, top_left)
+
+
 def test_empty_is_blank():
     assert render_markdown("", SIZE) == b"\x00" * EXPECTED
     # Level 0 is white, so a blank 4-colour frame is zeroes too.

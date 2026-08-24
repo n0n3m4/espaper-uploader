@@ -10,3 +10,16 @@ set_markdown:
       selector:
         text:
           multiline: true
+
+set_rotation:
+  target:
+    entity:
+      integration: espaper
+      domain: text
+  fields:
+    rotation:
+      required: true
+      example: 90
+      selector:
+        select:
+          options: ["0", "90", "180", "270"]

@@ -69,6 +69,9 @@ class EPaperCoordinator:
         # antialiased and the panel can show the greys, so this is the default.
         self.gray4 = True
         self.uploaded_gray4: bool | None = None
+        # Degrees clockwise, for a panel hung on its side or upside down.
+        self.rotation = 0
+        self.uploaded_rotation: int | None = None
         self.status = STATUS_IDLE
         self.last_error: str | None = None
         self.last_upload: datetime | None = None
@@ -133,7 +136,13 @@ class EPaperCoordinator:
     # ---------------------------------------------------------------- state
 
     @callback
-    def async_restore(self, markdown: str, uploaded: str | None) -> None:
+    def async_restore(
+        self,
+        markdown: str,
+        uploaded: str | None,
+        rotation: int = 0,
+        uploaded_rotation: int | None = None,
+    ) -> None:
         """Adopt state recovered from the text entity after a restart.
 
         If the panel was already showing this text before the restart there is
@@ -142,7 +151,17 @@ class EPaperCoordinator:
         """
         self.markdown = markdown
         self.uploaded_markdown = uploaded
-        self.status = STATUS_IDLE if markdown == uploaded else STATUS_PENDING
+        self.rotation = rotation
+        # Entries written before rotation existed have no uploaded_rotation;
+        # assume the panel already matches rather than repainting on upgrade.
+        self.uploaded_rotation = (
+            rotation if uploaded_rotation is None else uploaded_rotation
+        )
+        self.status = (
+            STATUS_IDLE
+            if (markdown, self.rotation) == (uploaded, self.uploaded_rotation)
+            else STATUS_PENDING
+        )
         self._maybe_upload()
 
     @callback
@@ -161,6 +180,17 @@ class EPaperCoordinator:
             return
         _LOGGER.debug("espaper %s: new markdown set, queueing upload", self.address)
         self.markdown = text
+        self.status = STATUS_PENDING
+        self.last_error = None
+        self._notify()
+        self._maybe_upload()
+
+    async def async_set_rotation(self, rotation: int) -> None:
+        """Turn the layout on the panel, and repaint."""
+        if rotation == self.rotation:
+            return
+        _LOGGER.debug("espaper %s: rotation %d, queueing upload", self.address, rotation)
+        self.rotation = rotation
         self.status = STATUS_PENDING
         self.last_error = None
         self._notify()
@@ -241,7 +271,7 @@ class EPaperCoordinator:
 
     async def _async_upload(self) -> None:
         """One upload attempt for whatever the text says right now."""
-        sending, gray4 = self.markdown, self.gray4
+        sending, gray4, rotation = self.markdown, self.gray4, self.rotation
         # Ask the bluetooth stack afresh: the cached device may predate an
         # adapter restart, and there may never have been an advertisement
         # callback to seed it in the first place.
@@ -272,7 +302,9 @@ class EPaperCoordinator:
         text = expand_escapes(sending)
         try:
             await self.display.push(
-                device, lambda w, h, g: render_markdown(text, (w, h), g), gray4
+                device,
+                lambda w, h, g: render_markdown(text, (w, h), g, rotation),
+                gray4,
             )
         except (EPaperError, TimeoutError, OSError) as err:
             # Expected while the board is in its ~60 s deep sleep: it is only
@@ -283,6 +315,7 @@ class EPaperCoordinator:
         else:
             self.uploaded_markdown = sending
             self.uploaded_gray4 = gray4
+            self.uploaded_rotation = rotation
             self.last_error = None
             self.last_upload = dt_util.utcnow()
             # Anything changed mid-upload -- text or colour depth -- is still
@@ -290,7 +323,7 @@ class EPaperCoordinator:
             # connecting on every wake.
             self.status = (
                 STATUS_IDLE
-                if (self.markdown, self.gray4) == (sending, gray4)
+                if self._current() == (sending, gray4, rotation)
                 else STATUS_PENDING
             )
             _LOGGER.debug("espaper %s: upload confirmed by the panel", self.address)
@@ -300,10 +333,15 @@ class EPaperCoordinator:
         # very task, which is still running, and refuse to re-kick.
         self._task = None
         if self.status == STATUS_PENDING:
-            if (self.markdown, self.gray4) == (sending, gray4):
+            if self._current() == (sending, gray4, rotation):
                 self._schedule_retry()  # failed; try again on the timer
             else:
                 self._maybe_upload()  # edited mid-upload; send the new frame now
+
+    @callback
+    def _current(self) -> tuple[str, bool, int]:
+        """Everything a frame depends on, for comparing against what was sent."""
+        return self.markdown, self.gray4, self.rotation
 
     @callback
     def _notify(self) -> None:

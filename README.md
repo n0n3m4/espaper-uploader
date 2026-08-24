@@ -86,8 +86,8 @@ type: custom:espaper-card
 entity: text.espaper_markdown
 ```
 
-A real textarea, no length cap, with the upload status underneath. Ctrl+Enter
-(⌘+Enter on a Mac) sends. If you edit the text somewhere else while you have
+A real textarea, no length cap, with the upload status and a rotation dropdown
+underneath. Ctrl+Enter (⌘+Enter on a Mac) sends. If you edit the text somewhere else while you have
 unsaved changes open, the card says so rather than overwriting what you typed.
 
 The integration serves the card itself, so there is no Lovelace resource to add
@@ -140,8 +140,27 @@ rather than rewriting itself the first time you save.
 ```
 
 The entity's attributes show `upload_status` (`idle`, `pending`, `uploading`),
-`last_upload`, `last_error`, and `uploaded_markdown` — what the panel is actually
-displaying right now.
+`last_upload`, `last_error`, `rotation`, and `uploaded_markdown` — what the panel
+is actually displaying right now.
+
+### Rotation
+
+The dropdown in the card's footer turns the layout 0/90/180/270° clockwise, for
+a panel hung on its side or upside down. A quarter turn lays the text out at
+300×400 — wrapping, margins and the clipping mark all follow the shape you are
+actually reading — and the frame is turned back to the panel's own 400×300 on
+the way out, so the firmware never learns about it. The choice survives a
+restart, and changing it repaints straight away.
+
+From an automation, or *Developer Tools → Actions*:
+
+```yaml
+      - action: espaper.set_rotation
+        target:
+          entity_id: text.espaper_markdown
+        data:
+          rotation: 90
+```
 
 ### The 4 colours switch
 

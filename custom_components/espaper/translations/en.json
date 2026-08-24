@@ -41,6 +41,16 @@
           "description": "Markdown to render. Supports headings, bullet and numbered lists, bold, code spans, block quotes and horizontal rules."
         }
       }
+    },
+    "set_rotation": {
+      "name": "Set rotation",
+      "description": "Turn the layout on the panel, for a display hung on its side or upside down.",
+      "fields": {
+        "rotation": {
+          "name": "Rotation",
+          "description": "Degrees clockwise: 0, 90, 180 or 270."
+        }
+      }
     }
   }
 }

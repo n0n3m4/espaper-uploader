@@ -12,7 +12,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import EPaperConfigEntry
-from .const import ATTR_MARKDOWN, SERVICE_SET_MARKDOWN
+from .const import (
+    ATTR_MARKDOWN,
+    ATTR_ROTATION,
+    ROTATIONS,
+    SERVICE_SET_MARKDOWN,
+    SERVICE_SET_ROTATION,
+)
 
 # Home Assistant truncates any entity state at 255 characters, so this is the
 # ceiling for the UI text box. Longer documents go through set_markdown and
@@ -27,10 +33,16 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the single text entity, and register the service on it."""
-    entity_platform.async_get_current_platform().async_register_entity_service(
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
         SERVICE_SET_MARKDOWN,
         {vol.Required(ATTR_MARKDOWN): cv.string},
         "async_set_markdown",
+    )
+    platform.async_register_entity_service(
+        SERVICE_SET_ROTATION,
+        {vol.Required(ATTR_ROTATION): vol.All(vol.Coerce(int), vol.In(ROTATIONS))},
+        "async_set_rotation",
     )
     async_add_entities([EPaperText(entry.runtime_data)])
 
@@ -64,6 +76,10 @@ class EPaperText(RestoreEntity, TextEntity):
             # Also the restore path for text longer than a state can hold.
             ATTR_FULL_MARKDOWN: self.coordinator.markdown,
             "uploaded_markdown": self.coordinator.uploaded_markdown,
+            # The card's rotation dropdown reads this; it is also how the
+            # setting survives a restart, like full_markdown above.
+            ATTR_ROTATION: self.coordinator.rotation,
+            "uploaded_rotation": self.coordinator.uploaded_rotation,
         }
 
     async def async_set_value(self, value: str) -> None:
@@ -73,6 +89,10 @@ class EPaperText(RestoreEntity, TextEntity):
     async def async_set_markdown(self, markdown: str) -> None:
         """Service target: same path, but no length ceiling."""
         await self.coordinator.async_set_markdown(markdown)
+
+    async def async_set_rotation(self, rotation: int) -> None:
+        """Service target: turn the layout on the panel."""
+        await self.coordinator.async_set_rotation(rotation)
 
     async def async_added_to_hass(self) -> None:
         """Restore the text and hand it back to the coordinator."""
@@ -88,4 +108,6 @@ class EPaperText(RestoreEntity, TextEntity):
             # for entries written before the attribute existed.
             attrs.get(ATTR_FULL_MARKDOWN) or last.state or "",
             attrs.get("uploaded_markdown"),
+            attrs.get(ATTR_ROTATION, 0),
+            attrs.get("uploaded_rotation"),
         )
