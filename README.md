@@ -73,8 +73,40 @@ automation:
           value: "# Bins\n\nNext: {{ states('sensor.next_bin_collection') }}"
 ```
 
-Home Assistant truncates any entity state at 255 characters. For longer
-documents use the service, which has no such limit:
+### Line breaks
+
+Home Assistant's text entity is single-line — its `TextMode` has only `text`
+and `password`, and the frontend renders an `<input>`, so pressing Enter in the
+box is simply not possible (the `input_text` helper has the same limitation).
+Markdown without line breaks is not much use, so there are three ways in:
+
+**Type `\n` in the text box.** A literal backslash-n is expanded to a real
+newline on the way to the panel:
+
+```
+# Shopping\n\n- Milk\n- **Eggs**
+```
+
+The entity keeps showing exactly what you typed, so editing it round-trips
+rather than rewriting itself the first time you save.
+
+**Use a YAML block scalar in an automation**, which gives real newlines:
+
+```yaml
+      - action: text.set_value
+        target:
+          entity_id: text.espaper_markdown
+        data:
+          value: |
+            # Shopping
+
+            - Milk
+            - **Eggs**
+```
+
+**Use the service**, whose field is a proper multi-line text area in
+*Developer Tools → Actions*. This is also the only route without the
+255-character cap:
 
 ```yaml
       - action: espaper.set_markdown

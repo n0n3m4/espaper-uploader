@@ -19,7 +19,9 @@ from custom_components.espaper.coordinator import (  # noqa: E402
     STATUS_IDLE,
     STATUS_PENDING,
     EPaperCoordinator,
+    expand_escapes,
 )
+from custom_components.espaper.render import render_markdown  # noqa: E402
 from custom_components.espaper.epaper import EPaperError  # noqa: E402
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
@@ -158,10 +160,29 @@ async def test_restore_after_restart_does_not_reupload():
     assert coordinator.status == STATUS_IDLE
 
 
+async def test_escaped_newlines_reach_the_panel():
+    # The single-line text box cannot hold a real newline, so a typed "\n"
+    # has to render as one -- otherwise every heading and bullet is impossible
+    # to enter from the UI.
+    coordinator, display = build()
+    await coordinator.async_set_markdown("# Title\\n\\n- one\\n- two")
+    await settle(coordinator)
+    assert display.pushes[0] == render_markdown("# Title\n\n- one\n- two", (400, 300))
+    # ...but the entity keeps showing what was typed, so editing round-trips.
+    assert coordinator.markdown == "# Title\\n\\n- one\\n- two"
+
+
+def test_real_newlines_are_untouched():
+    body = "# Title\n\n- one"
+    assert expand_escapes(body) == body
+
+
 async def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
-            await fn()
+            result = fn()
+            if asyncio.iscoroutine(result):
+                await result
             print(f"ok  {name}")
     print("all good")
 

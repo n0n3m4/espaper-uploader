@@ -29,7 +29,7 @@
   "services": {
     "set_markdown": {
       "name": "Set Markdown",
-      "description": "Set the Markdown shown on the panel. Unlike the text entity this has no 255-character limit.",
+      "description": "Set the Markdown shown on the panel. Unlike the text entity this is multi-line and has no 255-character limit.",
       "fields": {
         "markdown": {
           "name": "Markdown",

@@ -24,6 +24,22 @@ from .render import render_markdown
 
 _LOGGER = logging.getLogger(__name__)
 
+def expand_escapes(text: str) -> str:
+    r"""Turn a literal ``\n`` into a real newline.
+
+    Home Assistant's text entity is single-line -- ``TextMode`` offers only
+    ``text`` and ``password``, and the frontend renders an ``<input>``, so
+    there is no way to press Enter in it. Accepting the escape keeps that box
+    usable for multi-line notes. Text arriving with real newlines (the
+    ``set_markdown`` service, or a YAML block scalar) is untouched.
+
+    The expansion happens here, on the way to the renderer, rather than on the
+    way in: the entity keeps showing exactly what was typed, so editing it
+    round-trips instead of rewriting itself the first time it is saved.
+    """
+    return text.replace("\\n", "\n")
+
+
 STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
@@ -143,9 +159,10 @@ class EPaperCoordinator:
         self.status = STATUS_UPLOADING
         self._notify()
 
+        text = expand_escapes(sending)
         try:
             await self.display.push(
-                device, lambda w, h: render_markdown(sending, (w, h))
+                device, lambda w, h: render_markdown(text, (w, h))
             )
         except (EPaperError, TimeoutError, OSError) as err:
             # Stay pending: the next advertisement is another chance. The
