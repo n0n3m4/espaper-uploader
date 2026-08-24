@@ -11,7 +11,7 @@ current text, an advertisement must not cause another connection.
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -25,6 +25,16 @@ from custom_components.espaper.render import render_markdown  # noqa: E402
 from custom_components.espaper.epaper import EPaperError  # noqa: E402
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
+
+
+class _CapturedTimer:
+    """Stands in for the unsub that async_call_later returns."""
+
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __call__(self):  # cancelling the timer
+        self.callback = lambda _now: None
 
 
 class FakeDisplay:
@@ -41,7 +51,11 @@ class FakeDisplay:
 
 
 def build() -> tuple[EPaperCoordinator, FakeDisplay]:
-    """A coordinator whose background tasks are real asyncio tasks."""
+    """A coordinator whose background tasks are real asyncio tasks.
+
+    Retry timers are captured rather than scheduled, so a test can fire them
+    on demand instead of waiting RETRY_DELAY seconds.
+    """
     entry = MagicMock()
     tasks: list[asyncio.Task] = []
     entry.async_create_background_task = lambda hass, coro, name: tasks.append(
@@ -49,10 +63,21 @@ def build() -> tuple[EPaperCoordinator, FakeDisplay]:
     ) or task
     coordinator = EPaperCoordinator(MagicMock(), entry, ADDRESS)
     coordinator._tasks = tasks
+    coordinator._timers = []
     display = FakeDisplay()
     coordinator.display = display
     coordinator._device = MagicMock()  # pretend the panel is already known
     return coordinator, display
+
+
+def fire_retry(coordinator) -> bool:
+    """Run the pending retry timer, if one is armed. Returns whether it was."""
+    unsub = coordinator._retry_unsub
+    if unsub is None:
+        return False
+    coordinator._retry_unsub = None
+    unsub.callback(None)
+    return True
 
 
 async def settle(coordinator):
@@ -177,6 +202,52 @@ def test_real_newlines_are_untouched():
     assert expand_escapes(body) == body
 
 
+async def test_retries_without_any_advertisement():
+    """The bug this guards: Home Assistant suppresses repeat advertisements.
+
+    HA drops an advertisement identical to the previous one, and this board
+    broadcasts a constant payload, so after the first sighting the callback
+    stops arriving. Delivery therefore cannot depend on it -- a failed upload
+    must retry on a timer with no further advertisements at all.
+    """
+    coordinator, display = build()
+    display.fail = True
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert coordinator.status == STATUS_PENDING
+    assert coordinator._retry_unsub is not None, "no retry armed after a failure"
+
+    # The panel wakes, but HA never tells us. Only the timer can save this.
+    display.fail = False
+    assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert len(display.pushes) == 1, "timer retry did not deliver the frame"
+    assert coordinator.status == STATUS_IDLE
+
+
+async def test_success_arms_no_retry():
+    coordinator, display = build()
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert coordinator.status == STATUS_IDLE
+    assert coordinator._retry_unsub is None, "idle must not keep a timer armed"
+
+
+async def test_upload_without_a_cached_device_still_retries():
+    coordinator, display = build()
+    coordinator._device = None
+    with patch(
+        "custom_components.espaper.coordinator.bluetooth"
+        ".async_ble_device_from_address",
+        return_value=None,
+    ):
+        await coordinator.async_set_markdown("# Hello")
+        await settle(coordinator)
+    assert not display.pushes
+    assert coordinator.status == STATUS_PENDING
+    assert coordinator._retry_unsub is not None
+
+
 async def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
@@ -188,4 +259,17 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Capture retry timers instead of really scheduling them, and keep the
+    # bluetooth lookup from needing a running Home Assistant.
+    with (
+        patch(
+            "custom_components.espaper.coordinator.async_call_later",
+            new=lambda hass, delay, action: _CapturedTimer(action),
+        ),
+        patch(
+            "custom_components.espaper.coordinator.bluetooth"
+            ".async_ble_device_from_address",
+            return_value=None,
+        ),
+    ):
+        asyncio.run(main())

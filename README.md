@@ -171,6 +171,44 @@ spare the blank pixels it would take to separate sections by margin alone, so
 Regenerate the image above with `python docs/make_preview.py` after changing
 anything in `render.py`.
 
+## Troubleshooting
+
+Add this to `configuration.yaml` and restart, then watch **Settings → System →
+Logs** (or `home-assistant.log`):
+
+```yaml
+logger:
+  default: warning
+  logs:
+    custom_components.espaper: debug
+    homeassistant.components.bluetooth: debug
+```
+
+A healthy update looks like this:
+
+```
+espaper AA:BB:...: new markdown set, queueing upload
+espaper AA:BB:...: uploading 96 characters of markdown
+espaper AA:BB:...: panel 400x300, sleeps 60s between adverts
+espaper AA:BB:...: sending 15000 bytes, crc32=0x..., chunk=249
+espaper AA:BB:...: state=DONE err=NONE received=15000
+espaper AA:BB:...: upload confirmed by the panel
+```
+
+Reading the state:
+
+| Symptom | Meaning |
+|---|---|
+| `upload failed: ...` then `retrying in 30s` | Normal while the board is asleep — it is reachable ~2 s per minute, so a few failures before a success are expected. |
+| Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |
+| `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
+| `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
+| `state=ERROR err=BAD_GEOMETRY` | Firmware and renderer disagree on panel size — file a bug. |
+| Stuck at `pending` forever | Look for the 30 s retry lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
+
+The entity's `upload_status` attribute shows the same state without touching
+the logs.
+
 ## Development
 
 ```sh

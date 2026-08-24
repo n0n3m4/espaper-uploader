@@ -17,6 +17,7 @@ from bleak.backends.device import BLEDevice
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
 from .epaper import EPaperDisplay, EPaperError
@@ -44,6 +45,12 @@ STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
 
+# Seconds between attempts while a frame is owed. The board wakes about once a
+# minute, and establish_connection keeps the radio listening across a chunk of
+# that, so a retry on this cadence lands inside a wake window soon enough
+# without holding the adapter busy the whole time.
+RETRY_DELAY = 30
+
 
 class EPaperCoordinator:
     """Owns the desired text, the panel's actual text, and the gap between."""
@@ -62,6 +69,7 @@ class EPaperCoordinator:
 
         self._device: BLEDevice | None = None
         self._task: asyncio.Task | None = None
+        self._retry_unsub: Callable[[], None] | None = None
         self._listeners: list[Callable[[], None]] = []
         self._unsubs: list[Callable[[], None]] = []
 
@@ -90,6 +98,7 @@ class EPaperCoordinator:
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
+        self._cancel_retry()
         if self._task is not None and not self._task.done():
             self._task.cancel()
 
@@ -123,6 +132,7 @@ class EPaperCoordinator:
         """Set the text to display, and try to push it."""
         if text == self.markdown:
             return
+        _LOGGER.debug("espaper %s: new markdown set, queueing upload", self.address)
         self.markdown = text
         self.status = STATUS_PENDING
         self.last_error = None
@@ -137,27 +147,84 @@ class EPaperCoordinator:
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """The panel is awake: take the chance if we owe it a frame."""
+        """The panel is awake -- an opportunity, but never the only one.
+
+        This cannot be the retry mechanism. Home Assistant drops an
+        advertisement whose name, service UUIDs, service data and manufacturer
+        data all match the previous one, and this board advertises a constant
+        payload, so after the first sighting this callback essentially stops
+        firing. It is kept because it makes the first upload after a text
+        change immediate when the panel happens to be awake; _schedule_retry
+        is what actually guarantees delivery.
+        """
         self._device = service_info.device
+        _LOGGER.debug(
+            "espaper %s: advertisement seen, status=%s", self.address, self.status
+        )
         self._maybe_upload()
 
     @callback
     def _maybe_upload(self) -> None:
-        if self.status != STATUS_PENDING or self._device is None:
+        if self.status != STATUS_PENDING:
             return
         if self._task is not None and not self._task.done():
+            _LOGGER.debug("espaper %s: upload already in flight", self.address)
             return
+        self._cancel_retry()
         self._task = self.entry.async_create_background_task(
             self.hass, self._async_upload(), f"espaper upload {self.address}"
         )
 
+    @callback
+    def _cancel_retry(self) -> None:
+        if self._retry_unsub is not None:
+            self._retry_unsub()
+            self._retry_unsub = None
+
+    @callback
+    def _schedule_retry(self) -> None:
+        """Try again on a timer, since another advertisement may never come."""
+        self._cancel_retry()
+
+        @callback
+        def _retry(_now) -> None:
+            self._retry_unsub = None
+            _LOGGER.debug("espaper %s: retrying upload", self.address)
+            self._maybe_upload()
+
+        _LOGGER.debug(
+            "espaper %s: retrying in %ds", self.address, RETRY_DELAY
+        )
+        self._retry_unsub = async_call_later(self.hass, RETRY_DELAY, _retry)
+
     async def _async_upload(self) -> None:
         """One upload attempt for whatever the text says right now."""
         sending = self.markdown
-        device = self._device
-        assert device is not None
+        # Ask the bluetooth stack afresh: the cached device may predate an
+        # adapter restart, and there may never have been an advertisement
+        # callback to seed it in the first place.
+        device = (
+            bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            )
+            or self._device
+        )
+        if device is None:
+            _LOGGER.debug(
+                "espaper %s: no BLE device known yet, waiting", self.address
+            )
+            self.status = STATUS_PENDING
+            self._schedule_retry()
+            return
+
+        self._device = device
         self.status = STATUS_UPLOADING
         self._notify()
+        _LOGGER.debug(
+            "espaper %s: uploading %d characters of markdown",
+            self.address,
+            len(sending),
+        )
 
         text = expand_escapes(sending)
         try:
@@ -165,8 +232,8 @@ class EPaperCoordinator:
                 device, lambda w, h: render_markdown(text, (w, h))
             )
         except (EPaperError, TimeoutError, OSError) as err:
-            # Stay pending: the next advertisement is another chance. The
-            # board's own duty cycle rate-limits retries to one per wake.
+            # Expected while the board is in its ~60 s deep sleep: it is only
+            # reachable for about two seconds per cycle.
             _LOGGER.debug("espaper %s: upload failed: %s", self.address, err)
             self.last_error = str(err)
             self.status = STATUS_PENDING
@@ -177,14 +244,17 @@ class EPaperCoordinator:
             # Anything typed mid-upload is still owed to the panel; otherwise
             # this is the latch that stops us connecting on every wake.
             self.status = STATUS_IDLE if self.markdown == sending else STATUS_PENDING
+            _LOGGER.debug("espaper %s: upload confirmed by the panel", self.address)
 
         self._notify()
-        if self.status == STATUS_PENDING and self.markdown == sending:
-            return  # failed: wait for the next advertisement rather than spin
-        # Clear first: _maybe_upload's in-flight guard would otherwise see
-        # this very task, which is still running, and refuse to re-kick.
+        # Clear first: _maybe_upload's in-flight guard would otherwise see this
+        # very task, which is still running, and refuse to re-kick.
         self._task = None
-        self._maybe_upload()
+        if self.status == STATUS_PENDING:
+            if self.markdown == sending:
+                self._schedule_retry()  # failed; try again on the timer
+            else:
+                self._maybe_upload()  # edited mid-upload; send the new text now
 
     @callback
     def _notify(self) -> None:
