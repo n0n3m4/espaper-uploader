@@ -3,10 +3,10 @@
 A Home Assistant integration for the [BLE e-paper display](../README.md): an
 ESP32-H2 driving a 400×300 monochrome panel.
 
-You get a **text entity**. Put Markdown in it, and the integration renders it to
-a 1bpp frame and pushes it to the panel the next time the panel wakes up. Once
-the panel is showing the current text, nothing further happens — no polling, no
-reconnecting — until you change the text again.
+You get a **text entity** and a **dashboard card**. Put Markdown in either, and
+the integration renders it to a 1bpp frame and pushes it to the panel the next
+time the panel wakes up. Once the panel is showing the current text, nothing
+further happens — no polling, no reconnecting — until you change the text again.
 
 <p align="center">
   <img src="docs/preview.png" alt="The panel showing a rendered shopping list" width="436">
@@ -73,12 +73,31 @@ automation:
           value: "# Bins\n\nNext: {{ states('sensor.next_bin_collection') }}"
 ```
 
-### Line breaks
+### The card
 
-Home Assistant's text entity is single-line — its `TextMode` has only `text`
-and `password`, and the frontend renders an `<input>`, so pressing Enter in the
-box is simply not possible (the `input_text` helper has the same limitation).
-Markdown without line breaks is not much use, so there are three ways in:
+Home Assistant's text entity is single-line — its `TextMode` has only `text` and
+`password`, and the frontend renders an `<input>`, so pressing Enter in the box
+is simply not possible (the `input_text` helper has the same limitation). Its
+state is also capped at 255 characters. Markdown without line breaks is not much
+use, so the integration ships its own card:
+
+```yaml
+type: custom:espaper-card
+entity: text.espaper_markdown
+```
+
+A real textarea, no length cap, with the upload status underneath. Ctrl+Enter
+(⌘+Enter on a Mac) sends. If you edit the text somewhere else while you have
+unsaved changes open, the card says so rather than overwriting what you typed.
+
+The integration serves the card itself, so there is no Lovelace resource to add
+and nothing extra to install. If it does not appear, hard-refresh the browser;
+failing that, add `/espaper/espaper-card.js` manually under **Settings →
+Dashboards → three-dot menu → Resources** as a JavaScript module.
+
+Options: `entity` (required), `title`, and `rows` (default 10).
+
+### Without the card
 
 **Type `\n` in the text box.** A literal backslash-n is expanded to a real
 newline on the way to the panel:
@@ -105,8 +124,7 @@ rather than rewriting itself the first time you save.
 ```
 
 **Use the service**, whose field is a proper multi-line text area in
-*Developer Tools → Actions*. This is also the only route without the
-255-character cap:
+*Developer Tools → Actions*. This, like the card, has no 255-character cap:
 
 ```yaml
       - action: espaper.set_markdown
@@ -204,6 +222,7 @@ Reading the state:
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
 | `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
 | `state=ERROR err=BAD_GEOMETRY` | Firmware and renderer disagree on panel size — file a bug. |
+| The card is missing from the picker | Hard-refresh the browser. The card is served at `/espaper/espaper-card.js`; if that URL 404s, the integration failed to set up — check the logs. |
 | Stuck at `pending` forever | Look for the 30 s retry lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
 
 The entity's `upload_status` attribute shows the same state without touching
@@ -214,6 +233,7 @@ the logs.
 ```sh
 python test_render.py       # layout and packing; needs only Pillow
 python test_coordinator.py  # the upload-once latch; needs homeassistant importable
+node test_card.mjs          # the card's sync rule; needs only node
 ```
 
 Preview a layout without any hardware:

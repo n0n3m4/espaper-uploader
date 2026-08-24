@@ -9,7 +9,7 @@
   ],
   "codeowners": ["@n0n3m4"],
   "config_flow": true,
-  "dependencies": ["bluetooth_adapters"],
+  "dependencies": ["bluetooth_adapters", "frontend"],
   "documentation": "https://github.com/n0n3m4/espaper-uploader",
   "integration_type": "device",
   "iot_class": "local_push",

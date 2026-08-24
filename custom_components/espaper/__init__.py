@@ -7,6 +7,7 @@ from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
 
 from .coordinator import EPaperCoordinator
+from .frontend import async_register_card
 
 PLATFORMS = [Platform.TEXT]
 
@@ -15,6 +16,7 @@ type EPaperConfigEntry = ConfigEntry[EPaperCoordinator]
 
 async def async_setup_entry(hass: HomeAssistant, entry: EPaperConfigEntry) -> bool:
     """Set up an ESPaper display from a config entry."""
+    await async_register_card(hass)
     coordinator = EPaperCoordinator(hass, entry, entry.data[CONF_ADDRESS])
     await coordinator.async_start()
     entry.runtime_data = coordinator
