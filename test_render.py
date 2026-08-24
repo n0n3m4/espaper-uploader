@@ -65,6 +65,23 @@ def test_markup_is_not_literal():
     assert render_markdown("# Hi", SIZE) != render_markdown("\\# Hi", SIZE)
 
 
+def test_nothing_runs_off_the_edge():
+    # A pasted URL must be hard-split, not drawn past the right margin. The
+    # case that bites is a long token arriving on an almost-full line, so the
+    # padding is swept rather than guessed.
+    sources = ["x" * 500, SAMPLE]
+    sources += ["a" * pad + " " + "x" * 200 for pad in range(40, 56)]
+    for source in sources:
+        image = render_image(source, SIZE)
+        columns = image.convert("L").tobytes()
+        for row in range(SIZE[1]):
+            line = columns[row * SIZE[0] : (row + 1) * SIZE[0]]
+            rightmost = max(
+                (i for i, v in enumerate(line) if v == 0), default=-1
+            )
+            assert rightmost < SIZE[0] - 2, f"ink at x={rightmost} on row {row}"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

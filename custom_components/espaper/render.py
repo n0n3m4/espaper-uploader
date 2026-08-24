@@ -118,23 +118,23 @@ def _wrap(runs, size, max_width):
                     lines[-1].append((" ", bold, code))
                     width += font.getlength(" ")
                 continue
+            if width and width + token_width > max_width:
+                lines.append([])
+                width = 0.0
             while token_width > max_width:
-                # Unbreakable token: bite off as much as fits.
+                # Too wide even on an empty line (a pasted URL, say): bite off
+                # what fits rather than letting it run off the panel. `cut` is
+                # always at least 1, so this terminates.
                 cut = len(token)
-                while cut > 1 and font.getlength(token[:cut]) > max_width - width:
+                while cut > 1 and font.getlength(token[:cut]) > max_width:
                     cut -= 1
-                if cut <= 1 and width > 0:
-                    break  # no room left on this line, try the next one
                 lines[-1].append((token[:cut], bold, code))
                 lines.append([])
-                width = 0.0
                 token = token[cut:]
                 token_width = font.getlength(token)
-            if width + token_width > max_width and lines[-1]:
-                lines.append([])
-                width = 0.0
-            lines[-1].append((token, bold, code))
-            width += token_width
+            if token:
+                lines[-1].append((token, bold, code))
+                width += token_width
     return [line for line in lines if line]
 
 
