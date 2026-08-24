@@ -55,7 +55,7 @@ function ago(iso) {
   );
 }
 
-class ESPaperCard extends Base {
+export class ESPaperCard extends Base {
   constructor() {
     super();
     this._remote = null;
@@ -72,15 +72,23 @@ class ESPaperCard extends Base {
     }
     this._config = { rows: DEFAULT_ROWS, ...config };
     this._build();
+    // `hass` may already have arrived (see the setter), and nothing has been
+    // painted with it yet.
+    if (this._hass) this._update();
   }
 
   set hass(hass) {
     this._hass = hass;
-    this._update();
+    // Home Assistant hands a card `hass` before `setConfig` on several paths --
+    // the card picker's preview is one -- and until setConfig there is no
+    // config to read and no DOM to paint. Throwing here leaves that preview
+    // spinning forever, so wait to be configured instead.
+    if (this._config) this._update();
   }
 
   getCardSize() {
-    return 2 + Math.ceil(this._config.rows / 3);
+    // Also reachable before setConfig, and for the same reason.
+    return 2 + Math.ceil((this._config?.rows ?? DEFAULT_ROWS) / 3);
   }
 
   static getStubConfig(hass) {

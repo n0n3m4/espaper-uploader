@@ -11,9 +11,27 @@
 
 import assert from "node:assert/strict";
 
-import { nextValue } from "./custom_components/espaper/www/espaper-card.js";
+// Enough of a browser for the class body to load and one element to exist.
+// `customElements` stays undefined, so the module skips registering itself.
+globalThis.HTMLElement = class {
+  attachShadow() {
+    return {};
+  }
+};
+
+const { ESPaperCard, nextValue } = await import(
+  "./custom_components/espaper/www/espaper-card.js"
+);
 
 const cases = {
+  "an unconfigured card survives being handed hass": () => {
+    // The card picker builds a preview, sets `hass` on it, and only then calls
+    // setConfig. Throwing in the setter leaves that preview loading forever.
+    const card = new ESPaperCard();
+    card.hass = { states: {} };
+    assert.equal(typeof card.getCardSize(), "number");
+  },
+
   "nothing new from HA leaves the box alone": () => {
     assert.equal(nextValue("a", "a", "a typed draft", true), "a typed draft");
     assert.equal(nextValue("a", "a", "a typed draft", false), "a typed draft");
