@@ -4,3 +4,5 @@ __pycache__/
 venv/
 /preview*.png
 /CLAUDE.md
+/*.ttf
+/*.png

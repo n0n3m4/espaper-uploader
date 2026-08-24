@@ -176,7 +176,7 @@ A deliberate subset, chosen for what stays legible on a 400×300 panel:
 
 | Syntax | Rendered as |
 |---|---|
-| `# ## ###` | Headings, 26/21/17 px semibold; `#` and `##` get a rule under them |
+| `# ## ###` | Headings, 26/22/18 px semibold; `#` and `##` get a rule under them |
 | `- item` / `* item` | Bullet, hanging indent |
 | `1. item` | Numbered, hanging indent |
 | `**bold**`, `*italic*` | Semibold (see below) |

@@ -54,8 +54,8 @@ INK_CUTOFF = 160
 # batch of panels measures differently. Same table as tools/epaper_push.py.
 GRAY_LEVELS = (255, 202, 80, 0)
 
-BODY_SIZE = 15
-HEADING_SIZES = {1: 26, 2: 21, 3: 17}
+BODY_SIZE = 14
+HEADING_SIZES = {1: 26, 2: 22, 3: 18}
 # A panel this small looks cramped rather than dense with a hairline margin.
 MARGIN = 13
 # Air above a heading that follows something. Grouping a heading with the text
