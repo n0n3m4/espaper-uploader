@@ -208,10 +208,18 @@ A healthy update looks like this:
 espaper AA:BB:...: new markdown set, queueing upload
 espaper AA:BB:...: uploading 96 characters of markdown
 espaper AA:BB:...: panel 400x300, sleeps 60s between adverts
-espaper AA:BB:...: sending 15000 bytes, crc32=0x..., chunk=249
-espaper AA:BB:...: state=DONE err=NONE received=15000
+espaper AA:BB:...: sending 2275 of 15000 bytes (deflate=True), crc32=0x..., chunk=249
+espaper AA:BB:...: state=DONE err=NONE received=2275
 espaper AA:BB:...: upload confirmed by the panel
 ```
+
+The frame is deflated when that comes out smaller, which for a page of rendered
+text means about a sixth of the bytes and a sixth of the time on air. The panel
+is only awake ~2 s a minute, so a shorter upload is also a likelier one. The
+firmware inflates it from the ESP32-H2 ROM's copy of miniz; if it ever reports
+`err=INFLATE` the stream passed its CRC but did not decompress, which means the
+two sides disagree about the format rather than that the radio dropped
+something.
 
 Reading the state:
 

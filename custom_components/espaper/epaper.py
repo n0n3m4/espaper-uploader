@@ -55,8 +55,13 @@ ERROR_NAMES = {
     7: "NO_SESSION",
     8: "NO_MEMORY",
     9: "INCOMPLETE",
+    10: "INFLATE",
 }
 STATE_DONE, STATE_ERROR = 4, 5
+
+# BEGIN flags. Bit 0 would invert the bit convention and bit 1 selects 2bpp;
+# this client uses neither. Bit 2 says the payload is a zlib stream.
+FLAG_DEFLATE = 1 << 2
 
 # Largest ATT payload NimBLE will accept (MTU 256 minus the 3-byte write
 # header), and the 4-byte offset each data chunk carries.
@@ -105,13 +110,13 @@ class _StatusTracker:
         )
 
 
-def _build_begin(width: int, height: int, length: int, crc: int) -> bytes:
+def _build_begin(width: int, height: int, length: int, crc: int, deflate: bool) -> bytes:
     return struct.pack(
         "<B4sBBHHII",
         OP_BEGIN,
         MAGIC,
         PROTOCOL_VERSION,
-        0,  # flags: bit 0 would invert the bit convention; we never do
+        FLAG_DEFLATE if deflate else 0,
         width,
         height,
         length,
@@ -207,19 +212,33 @@ class EPaperDisplay:
         height: int,
         payload: bytes,
     ) -> None:
+        # A page of rendered text deflates to roughly a sixth of a frame, which
+        # is a sixth of the chunks and of the awake burst that dominates the
+        # board's power budget. Nothing is lost when it does not compress: send
+        # whichever is shorter and let the flag say which it was.
+        raw = len(payload)
+        squeezed = zlib.compress(payload, 9)
+        deflate = len(squeezed) < raw
+        if deflate:
+            payload = squeezed
+
         crc = zlib.crc32(payload) & 0xFFFFFFFF
         chunk = _chunk_size(client)
         _LOGGER.debug(
-            "espaper %s: sending %d bytes, crc32=0x%08x, chunk=%d",
+            "espaper %s: sending %d of %d bytes (deflate=%s), crc32=0x%08x, chunk=%d",
             self.address,
             len(payload),
+            raw,
+            deflate,
             crc,
             chunk,
         )
 
         status.updated.clear()
         await client.write_gatt_char(
-            CHR_CTRL, _build_begin(width, height, len(payload), crc), response=True
+            CHR_CTRL,
+            _build_begin(width, height, len(payload), crc, deflate),
+            response=True,
         )
         # The device acks the header with a status notification; if it rejected
         # the header there is no point streaming 15 kB at it.
