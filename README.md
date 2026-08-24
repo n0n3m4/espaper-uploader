@@ -8,7 +8,28 @@ a 1bpp frame and pushes it to the panel the next time the panel wakes up. Once
 the panel is showing the current text, nothing further happens — no polling, no
 reconnecting — until you change the text again.
 
-![Rendered example](docs/preview.png)
+<p align="center">
+  <img src="docs/preview.png" alt="The panel showing a rendered shopping list" width="436">
+</p>
+
+That panel is [this Markdown](docs/sample.md):
+
+```markdown
+# Groceries
+
+Pick up on the way home from **Netto**, before 8pm.
+
+- Milk, 2 L
+- 500 g of `flour`
+- A really long item name that has to wrap onto the next line neatly
+1. Bread
+2. Eggs
+
+## Notes
+> The panel refreshes about once a minute, and holds the image with no power.
+
+Set from an automation with `espaper.set_markdown`.
+```
 
 ## Why it works this way
 
@@ -78,12 +99,12 @@ A deliberate subset, chosen for what stays legible on a 400×300 1bpp panel:
 
 | Syntax | Rendered as |
 |---|---|
-| `# ## ###` | Headings, 26/21/17 px semibold |
+| `# ## ###` | Headings, 26/21/17 px semibold; `#` and `##` get a rule under them |
 | `- item` / `* item` | Bullet, hanging indent |
 | `1. item` | Numbered, hanging indent |
 | `**bold**`, `*italic*` | Semibold (see below) |
 | `` `code` `` | White-on-black box |
-| `> quote` | Indented, with a rule |
+| `> quote` | Indented, with a bar down the whole quote |
 | `---` | Horizontal rule |
 | blank line | Paragraph gap |
 
@@ -110,6 +131,13 @@ Two other things matter more than they look like they should:
 - Line pitch comes from the *ink* band (`getbbox("Ag")`), not from the font's
   ascent + descent. Noto's built-in line gap is generous, and on a 300 px panel
   that generosity costs about three lines of text.
+
+Structure is carried by rules rather than whitespace — a 300 px panel cannot
+spare the blank pixels it would take to separate sections by margin alone, so
+`#` and `##` get a hairline under them and block quotes get a bar down the side.
+
+Regenerate the image above with `python docs/make_preview.py` after changing
+anything in `render.py`.
 
 ## Development
 

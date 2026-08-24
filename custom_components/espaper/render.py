@@ -17,7 +17,10 @@ Everything here is tuned for a 1bpp panel rather than a screen:
   which is set above mid-grey deliberately: edge pixels that are only slightly
   grey become ink, thickening stems instead of eroding them,
 * `code` spans render as white-on-black boxes rather than in a mono face --
-  at this size a weight change is invisible but an inverted box is not.
+  at this size a weight change is invisible but an inverted box is not,
+* structure is drawn rather than spaced: headings get a rule under them and
+  quotes a bar beside them, because 300 px of height cannot spare the blank
+  rows it would take to separate sections by margin alone.
 """
 
 from __future__ import annotations
@@ -38,7 +41,12 @@ INK_CUTOFF = 160
 
 BODY_SIZE = 15
 HEADING_SIZES = {1: 26, 2: 21, 3: 17}
-MARGIN = 8
+# A panel this small looks cramped rather than dense with a hairline margin.
+MARGIN = 13
+# Air above a heading that follows something. Grouping a heading with the text
+# under it, rather than floating it midway, is most of what makes the layout
+# read as deliberate.
+HEADING_LEAD = 7
 # Leading added below each line, as a fraction of the font size. Noto's own
 # ascent+descent carries far more slack than a 300 px panel can afford, so the
 # pitch is built from the ink band instead (see _metrics).
@@ -175,6 +183,8 @@ def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
         prefix = ""
         font_size = BODY_SIZE
         bold_all = False
+        heading_level = 0
+        quoted = False
 
         if not line.strip():
             y += PARAGRAPH_GAP
@@ -191,14 +201,13 @@ def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
             font_size = HEADING_SIZES[level]
             bold_all = True
             line = match.group(2)
+            heading_level = level
+            if y > MARGIN:  # not the very first line
+                y += HEADING_LEAD
         elif match := _QUOTE.match(line):
             indent = INDENT
+            quoted = True
             line = match.group(1)
-            draw.line(
-                (MARGIN + 3, y + _metrics(BODY_SIZE)[1], MARGIN + 3, y + _metrics(BODY_SIZE)[2]),
-                fill=0,
-                width=2,
-            )
         elif match := _BULLET.match(line):
             prefix = "• "
             indent = INDENT
@@ -220,25 +229,36 @@ def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
                 (MARGIN, y), prefix, font=_font(bold_all, font_size), fill=0
             )
 
-        pitch, _, ink_bottom = _metrics(font_size)
+        pitch, ink_top, ink_bottom = _metrics(font_size)
+        quote_top = y + ink_top
         for wrapped in _wrap(runs, font_size, width - MARGIN - x0):
             if y + ink_bottom > bottom:
                 clipped = True
                 break
             _draw_line(draw, x0, y, wrapped, font_size)
             y += pitch
+        if quoted and y > quote_top:
+            # One bar for the whole quote, not a tick per line.
+            draw.rectangle(
+                (MARGIN, quote_top, MARGIN + 2, y - pitch + ink_bottom), fill=0
+            )
+        if 1 <= heading_level <= 2 and not clipped:
+            # A rule under the top two levels separates sections far more
+            # cheaply than whitespace can on a 300 px panel.
+            rule_y = y - pitch + ink_bottom + 3
+            draw.line((MARGIN, rule_y, width - MARGIN, rule_y), fill=0)
+            y += 6
         if clipped:
             break
 
     if clipped:
         # Tell the reader something is missing rather than ending mid-sentence.
         font = _font(True, BODY_SIZE)
-        draw.text(
-            (width - MARGIN - font.getlength("…"), bottom - BODY_SIZE),
-            "…",
-            font=font,
-            fill=0,
-        )
+        mark_w = font.getlength("…")
+        x0 = width - MARGIN - mark_w
+        # Clear a patch first: the clipped line may already occupy this corner.
+        draw.rectangle((x0 - 4, bottom - BODY_SIZE - 2, width, height), fill=255)
+        draw.text((x0, bottom - BODY_SIZE), "…", font=font, fill=0)
 
     return canvas.point(lambda v: 255 if v >= INK_CUTOFF else 0, mode="1")
 
