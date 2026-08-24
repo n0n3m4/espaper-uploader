@@ -37,6 +37,20 @@ async def async_register_card(hass: HomeAssistant) -> None:
         return
     hass.data[_REGISTERED] = True
 
+    # In the executor: HA runs the very same isdir check off-loop inside
+    # async_register_static_paths.
+    if not await hass.async_add_executor_job(CARD_PATH.is_file):
+        # Worth a warning rather than a 404 later: this means the install is
+        # incomplete (an old HACS download, or a hand-copy that missed www/),
+        # and the symptom -- "custom element doesn't exist" -- points nowhere
+        # near the cause.
+        _LOGGER.warning(
+            "espaper: %s is missing, so the dashboard card will not load; "
+            "re-download the integration",
+            CARD_PATH,
+        )
+        return
+
     await hass.http.async_register_static_paths(
         [StaticPathConfig(CARD_URL, str(CARD_PATH), cache_headers=False)]
     )
@@ -44,4 +58,4 @@ async def async_register_card(hass: HomeAssistant) -> None:
     # second copy of the version drifts on release and serves a stale card.
     version = (await async_get_integration(hass, DOMAIN)).version
     frontend.add_extra_js_url(hass, f"{CARD_URL}?v={version}")
-    _LOGGER.debug("espaper: card registered at %s", CARD_URL)
+    _LOGGER.info("espaper: dashboard card served at %s?v=%s", CARD_URL, version)

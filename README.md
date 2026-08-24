@@ -222,7 +222,7 @@ Reading the state:
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
 | `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
 | `state=ERROR err=BAD_GEOMETRY` | Firmware and renderer disagree on panel size — file a bug. |
-| The card is missing from the picker | Hard-refresh the browser. The card is served at `/espaper/espaper-card.js`; if that URL 404s, the integration failed to set up — check the logs. |
+| The card is missing from the picker | Open `/espaper/espaper-card.js` in a browser tab. A 404 means the integration never registered it — the log says `dashboard card served at ...` on a good start, and warns if `www/espaper-card.js` is missing from the install. If it serves fine, it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
 | Stuck at `pending` forever | Look for the 30 s retry lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
 
 The entity's `upload_status` attribute shows the same state without touching
