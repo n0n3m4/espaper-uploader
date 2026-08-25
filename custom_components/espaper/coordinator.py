@@ -334,9 +334,11 @@ class EPaperCoordinator:
         once a burst is spent -- the same cost, plus the fact that a proxy which
         never scans can never tell us the panel has gone.
 
-        In between it is just MIN_DELAY, over and over: each attempt is a 20 s
-        net, so back-to-back attempts leave the panel nowhere to wake up
-        unnoticed.
+        In between it is 0.0, over and over: each attempt is a 20 s net, so
+        back-to-back nets leave the panel nowhere to wake up unnoticed. The only
+        thing that ever delays one is MIN_DELAY, the cool-off after a failure --
+        and it has to be a delay only *once*, or the timer that fires it will
+        just re-decide the same wait and never open a net at all.
         """
         age = self._last_seen()
         if age is None or age > ONLINE_TTL:
@@ -349,7 +351,7 @@ class EPaperCoordinator:
             return MIN_DELAY if self._cooling_off else 0.0
         if self._burst_until is None or time.monotonic() >= self._burst_until:
             return None
-        return MIN_DELAY
+        return MIN_DELAY if self._cooling_off else 0.0
 
     @callback
     def _maybe_upload(self) -> None:
@@ -423,6 +425,9 @@ class EPaperCoordinator:
                 "espaper %s: no BLE device known yet, waiting", self.address
             )
             self.status = STATUS_PENDING
+            # Same cool-off a failure gets: without it this arms a zero-second
+            # timer and re-enters here as fast as the event loop allows.
+            self._cooling_off = True
             self._schedule_retry()
             return
 

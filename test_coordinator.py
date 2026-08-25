@@ -52,10 +52,14 @@ class FakeDisplay:
 
     def __init__(self):
         self.pushes: list[bytes] = []
+        # Every net opened, failed ones included -- pushes only counts the ones
+        # that landed.
+        self.attempts = 0
         self.fail = False
         self.error: Exception = EPaperError("boom")
 
     async def push(self, device, payload_for, gray4=False):
+        self.attempts += 1
         if self.fail:
             raise self.error
         self.pushes.append(payload_for(400, 300, gray4))
@@ -365,16 +369,23 @@ async def test_keeps_the_net_open_while_online():
     at a predicted wake was fragile: every miss cost a whole cycle.
     """
     coordinator, display = build()
+    display.fail = True
     with seen(20):
+        # Mid-sleep is not a reason to wait: the net is open for 20 s and the
+        # panel walks into it when it wakes.
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
-    assert not display.pushes, "connected in the middle of the panel's sleep"
-    assert coordinator.status == STATUS_PENDING
-    assert armed_delay(coordinator) == MIN_DELAY
+        assert display.attempts == 1, "waited out the sleep instead of netting"
+        assert coordinator.status == STATUS_PENDING
+        assert armed_delay(coordinator) == MIN_DELAY, "no cool-off after a failure"
 
-    # ...and when it fires, the frame goes out.
-    assert fire_retry(coordinator)
-    await settle(coordinator)
+        # The cool-off delays one net; it must not become the answer forever.
+        # The bug it guards: the timer fires, re-decides the same MIN_DELAY and
+        # arms itself again, so a burst spins at 2 s and never connects at all.
+        display.fail = False
+        assert fire_retry(coordinator)
+        await settle(coordinator)
+        assert display.attempts == 2, "the cool-off swallowed the whole burst"
     assert len(display.pushes) == 1
     assert coordinator.status == STATUS_IDLE
 
@@ -388,15 +399,17 @@ async def test_burst_expires_into_a_quiet_gap():
     alone for a while.
     """
     coordinator, display = build()
+    display.fail = True
     with seen(20):
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
         assert armed_delay(coordinator) == MIN_DELAY
 
         coordinator._burst_until = time.monotonic() - 1
+        display.attempts = 0
         assert fire_retry(coordinator)
         await settle(coordinator)
-    assert not display.pushes, "kept hammering past the end of the burst"
+    assert not display.attempts, "kept hammering past the end of the burst"
     assert armed_delay(coordinator) == OFFLINE_POLL
 
 
@@ -407,6 +420,7 @@ async def test_a_fresh_sighting_rearms_the_burst():
     advertisements, so the tick reading the history is what has to notice.
     """
     coordinator, display = build()
+    display.fail = True
     with seen(20):
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
@@ -417,8 +431,10 @@ async def test_a_fresh_sighting_rearms_the_burst():
 
     # The quiet gap lets the proxy scan again, and it hears the panel.
     with seen(10):
+        display.attempts = 0
         coordinator._async_tick(None)
-    assert armed_delay(coordinator) == MIN_DELAY, "a live panel was left queued"
+        await settle(coordinator)
+    assert display.attempts == 1, "a live panel was left queued"
     assert coordinator._burst_until - time.monotonic() > BURST - 5
 
 
@@ -553,7 +569,9 @@ async def test_upload_without_a_cached_device_still_retries():
         await settle(coordinator)
     assert not display.pushes
     assert coordinator.status == STATUS_PENDING
-    assert coordinator._retry_unsub is not None
+    # ...on a timer, not immediately: re-entering here with no device is a hot
+    # loop, so it gets the same cool-off a failure does.
+    assert armed_delay(coordinator) == MIN_DELAY
 
 
 async def main():
