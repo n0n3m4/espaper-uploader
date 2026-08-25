@@ -11,9 +11,10 @@ mis-aimed net used to cost a whole cycle.
 
 It does that only while an upload is outstanding, and only while the panel is
 online -- a connection attempt is not free on an ESPHome Bluetooth proxy, which
-has a handful of connection slots and stops scanning while it opens one. Which
-is also why the nets run in a bounded BURST with a quiet gap after it: our own
-connecting blinds the scanner that tells us the panel is still there.
+has a handful of connection slots and stops scanning for the whole time it is
+initiating one. So while a frame is owed to a panel that is not answering, that
+proxy hears nothing, for anything: ONLINE_TTL is what bounds it, since our own
+connecting is also what stops the sightings that would keep it alive.
 """
 
 from __future__ import annotations
@@ -58,25 +59,19 @@ STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
 
-# How long to keep re-arming the net once a frame is owed. Each attempt is
-# bleak's own 20 s connect timeout, so this covers about two and a half of the
-# panel's ~62 s wake cycles -- far more than enough to catch a panel that is
-# really there. BURST is the knob.
-# ponytail: a panel that advertises but never accepts a connection re-arms this
-# every cycle, holding ~70% duty on the proxy while a frame is owed. Back the
-# burst off after N consecutive failed bursts if that ever shows up.
-BURST = 150
-# A sighting this fresh means the panel is probably awake this second, so there
-# is nothing to wait for.
-INSIDE_WINDOW = 3
-# ...but never two attempts closer together than this, or a push that fails
-# instantly spins. Doubles as the gap between the nets of a burst.
+# Never two attempts closer together than this. Not pacing -- a net that ran
+# its full 20 s has already waited it out -- purely a rate limit on failures
+# that come back instantly, which would otherwise spin.
 MIN_DELAY = 2
 
 # Five missed wake cycles. Past this the panel is off, flat or out of range, and
 # attempts stop: on an ESPHome proxy each one occupies one of about three
 # connection slots and pauses the scanning everything else on it depends on.
 # Only the (free) advertisement history is watched, on this cadence.
+# ponytail: this is also the only bound on how long a frame owed to an absent
+# panel blinds that proxy, since a net suppresses the very sightings that would
+# refresh it -- up to five minutes of no advertisements for anything else behind
+# it. Put a bounded burst and a quiet gap back if that ever bites.
 ONLINE_TTL = 300
 OFFLINE_POLL = 60
 
@@ -107,11 +102,10 @@ class EPaperCoordinator:
         self.online = False
         self.last_seen: datetime | None = None
 
-        self._cooling_off = False
-        # Deadline for the current burst of attempts, and the monotonic stamp of
-        # the sighting that last armed one.
-        self._burst_until: float | None = None
-        self._sighting: float | None = None
+        # Monotonic stamp of the last attempt, for the MIN_DELAY rate limit,
+        # and of the last connection the panel actually answered.
+        self._last_attempt = 0.0
+        self._last_contact = float("-inf")
         self._device: BLEDevice | None = None
         self._task: asyncio.Task | None = None
         self._retry_unsub: Callable[[], None] | None = None
@@ -251,10 +245,9 @@ class EPaperCoordinator:
 
     @callback
     def _queue(self) -> None:
-        """A frame is now owed: open a burst of attempts and start trying."""
+        """A frame is now owed: start opening nets for it."""
         self.status = STATUS_PENDING
         self.last_error = None
-        self._burst_until = time.monotonic() + BURST
         self._notify()
         self._maybe_upload()
 
@@ -278,26 +271,34 @@ class EPaperCoordinator:
         _LOGGER.debug(
             "espaper %s: advertisement seen, status=%s", self.address, self.status
         )
-        # Proof the panel is up this instant, which outranks the cool-off after
-        # a failure -- that exists to stop a spin, and a spin does not advertise.
-        self._cooling_off = False
+        # Proof the panel is up this instant, which outranks the rate limit --
+        # that exists to stop a spin, and a spin does not advertise.
+        self._last_attempt = 0.0
         self._refresh_online()
         self._maybe_upload()
 
     @callback
     def _last_seen(self) -> float | None:
-        """Seconds since a connectable scanner last heard this panel.
+        """Seconds since this panel last proved it was there.
 
-        ``None`` if there is no sighting at all -- HA drops a device from its
-        advertisement history once it has been quiet for long enough, so this
-        is also where a panel that has been off for a while ends up.
+        Usually a sighting by a connectable scanner. ``None`` if there is no
+        evidence at all -- HA drops a device from its advertisement history once
+        it has been quiet for long enough, so that is also where a panel that
+        has been off for a while ends up.
+
+        A connection the panel answered counts, and outranks the history: our
+        own netting is what stops a proxy scanning, so by the time a frame lands
+        the last advertisement can be minutes old.
         """
         info = bluetooth.async_last_service_info(
             self.hass, self.address, connectable=True
         )
-        if info is None:
+        stamp = self._last_contact
+        if info is not None:
+            stamp = max(stamp, info.time)
+        if stamp == float("-inf"):
             return None
-        return time.monotonic() - info.time
+        return time.monotonic() - stamp
 
     @callback
     def _refresh_online(self) -> None:
@@ -305,16 +306,6 @@ class EPaperCoordinator:
         age = self._last_seen()
         if age is not None:
             self.last_seen = dt_util.utcnow() - timedelta(seconds=age)
-            # A sighting later than the one that armed the last burst means the
-            # panel is still cycling, so it is worth holding the net open again.
-            # Deliberately not driven by the advertisement callback: HA
-            # suppresses this board's repeat advertisements, but the history
-            # this reads keeps moving, and the tick keeps reading it.
-            stamp = time.monotonic() - age
-            if self._sighting is None or stamp > self._sighting + 1:
-                self._sighting = stamp
-                if self.status == STATUS_PENDING:
-                    self._burst_until = time.monotonic() + BURST
         online = age is not None and age <= ONLINE_TTL
         if online == self.online:
             return
@@ -328,30 +319,23 @@ class EPaperCoordinator:
     def _next_attempt_delay(self) -> float | None:
         """Seconds to wait before the next attempt, or ``None`` for "don't".
 
-        ``None`` while the panel is offline: there is nothing worth connecting
-        to, and on a proxy an attempt costs a connection slot and a pause in
-        scanning that every other device behind it pays for. And ``None`` again
-        once a burst is spent -- the same cost, plus the fact that a proxy which
-        never scans can never tell us the panel has gone.
+        ``None`` while the panel is offline, and only then: there is nothing
+        worth connecting to, and on a proxy an attempt costs a connection slot
+        and a pause in scanning that every other device behind it pays for.
 
-        In between it is 0.0, over and over: each attempt is a 20 s net, so
-        back-to-back nets leave the panel nowhere to wake up unnoticed. The only
-        thing that ever delays one is MIN_DELAY, the cool-off after a failure --
-        and it has to be a delay only *once*, or the timer that fires it will
-        just re-decide the same wait and never open a net at all.
+        Otherwise 0.0, over and over -- each attempt is a 20 s net, so
+        back-to-back nets leave the panel nowhere to wake up unnoticed. The one
+        thing that can delay a net is MIN_DELAY, and only for a failure that
+        came back faster than that.
         """
         age = self._last_seen()
         if age is None or age > ONLINE_TTL:
             return None
-        if age <= INSIDE_WINDOW:
-            # Awake right now, most likely, so go -- unless the last attempt
-            # failed and nothing has happened since, because a push that fails
-            # instantly would otherwise re-kick itself as fast as the event loop
-            # allows until the sighting aged out.
-            return MIN_DELAY if self._cooling_off else 0.0
-        if self._burst_until is None or time.monotonic() >= self._burst_until:
-            return None
-        return MIN_DELAY if self._cooling_off else 0.0
+        # Never two attempts closer than MIN_DELAY: a push that fails instantly
+        # -- no connection slot free on the proxy, no BlueZ path, no BLEDevice
+        # -- would otherwise re-kick itself as fast as the event loop allows. A
+        # net that ran its full 20 s has already waited this out.
+        return max(0.0, self._last_attempt + MIN_DELAY - time.monotonic())
 
     @callback
     def _maybe_upload(self) -> None:
@@ -364,6 +348,7 @@ class EPaperCoordinator:
             self._schedule_retry()
             return
         self._cancel_retry()
+        self._last_attempt = time.monotonic()
         self._task = self.entry.async_create_background_task(
             self.hass, self._async_upload(), f"espaper upload {self.address}"
         )
@@ -382,16 +367,14 @@ class EPaperCoordinator:
         @callback
         def _retry(_now) -> None:
             self._retry_unsub = None
-            # Whatever we were waiting out, we have now waited it out.
-            self._cooling_off = False
             self._maybe_upload()
 
         delay = self._next_attempt_delay()
+        why = ""
         if delay is None:
-            why = " (panel offline)" if not self.online else " (holding off)"
+            # The only reason there is: no sighting inside ONLINE_TTL.
+            why = " (panel offline)"
             delay = OFFLINE_POLL
-        else:
-            why = ""
         _LOGGER.debug(
             "espaper %s: next attempt in %.0fs%s", self.address, delay, why
         )
@@ -401,9 +384,9 @@ class EPaperCoordinator:
     def _async_tick(self, _now) -> None:
         """Age the online flag out, and re-decide what a frame still owed wants.
 
-        Unconditional, because _refresh_online may just have re-armed the burst
-        off a fresh sighting -- in which case the long quiet-gap timer already
-        armed is now the wrong one, and only re-deciding replaces it.
+        Unconditional, because a panel that has just come back is sitting behind
+        an OFFLINE_POLL timer that is now the wrong one, and only re-deciding
+        replaces it.
         """
         self._refresh_online()
         self._maybe_upload()
@@ -425,9 +408,8 @@ class EPaperCoordinator:
                 "espaper %s: no BLE device known yet, waiting", self.address
             )
             self.status = STATUS_PENDING
-            # Same cool-off a failure gets: without it this arms a zero-second
-            # timer and re-enters here as fast as the event loop allows.
-            self._cooling_off = True
+            # The MIN_DELAY rate limit is what keeps this from re-entering as
+            # fast as the event loop allows: _maybe_upload stamped the attempt.
             self._schedule_retry()
             return
 
@@ -463,13 +445,22 @@ class EPaperCoordinator:
             # what says the panel is genuinely not there.
             self.last_error = str(err) if isinstance(err, EPaperError) else None
             self.status = STATUS_PENDING
-            self._cooling_off = True
         else:
             self.uploaded_markdown = sending
             self.uploaded_gray4 = gray4
             self.uploaded_rotation = rotation
             self.last_error = None
             self.last_upload = dt_util.utcnow()
+            # The panel just answered, which beats any advertisement. Without
+            # this the next edit can find it "offline" seconds after it took a
+            # frame, and refuse to open a net for it.
+            self._last_contact = time.monotonic()
+            self._refresh_online()
+            # And it does not count against the rate limit: that guards against
+            # a push that fails instantly, and an attempt that got a whole
+            # connection, transfer and repaint out of the panel is not one. If
+            # the text moved under us, the next net opens now.
+            self._last_attempt = 0.0
             # Anything changed mid-upload -- text or colour depth -- is still
             # owed to the panel; otherwise this is the latch that stops us
             # connecting on every wake.
@@ -477,11 +468,6 @@ class EPaperCoordinator:
                 STATUS_IDLE
                 if self._current() == (sending, gray4, rotation)
                 else STATUS_PENDING
-            )
-            # Done, unless the text moved under us -- in which case the panel
-            # was awake a moment ago and a fresh burst is exactly right.
-            self._burst_until = (
-                None if self.status == STATUS_IDLE else time.monotonic() + BURST
             )
             _LOGGER.debug("espaper %s: upload confirmed by the panel", self.address)
 
@@ -491,7 +477,7 @@ class EPaperCoordinator:
         self._task = None
         # Whether this failed or the text was edited mid-upload, the panel is
         # asleep now -- it sleeps the moment it has rendered -- so both want the
-        # same thing: another attempt, as soon as the burst allows.
+        # same thing: the next net, opened straight away.
         self._maybe_upload()
 
     @callback

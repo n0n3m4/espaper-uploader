@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from custom_components.espaper.coordinator import (  # noqa: E402
-    BURST,
     MIN_DELAY,
     OFFLINE_POLL,
     ONLINE_TTL,
@@ -111,11 +110,17 @@ def armed_delay(coordinator) -> int:
 
 
 def fire_retry(coordinator) -> bool:
-    """Run the pending retry timer, if one is armed. Returns whether it was."""
+    """Run the pending retry timer, if one is armed. Returns whether it was.
+
+    Rewinds the attempt stamp by the delay the timer was armed with, because a
+    timer firing means that time really passed -- and the MIN_DELAY rate limit
+    is measured against it.
+    """
     unsub = coordinator._retry_unsub
     if unsub is None:
         return False
     coordinator._retry_unsub = None
+    coordinator._last_attempt -= unsub.delay or 0
     unsub.callback(None)
     return True
 
@@ -360,13 +365,14 @@ async def test_retries_without_any_advertisement():
     assert coordinator.status == STATUS_IDLE
 
 
-async def test_keeps_the_net_open_while_online():
-    """No prediction: while a frame is owed, just keep re-arming the net.
+async def test_nets_run_back_to_back():
+    """No prediction, and no gap: while a frame is owed, keep netting.
 
     A connect attempt is a 20 s net -- the controller holds the request pending
-    and latches onto the panel's first advertisement -- so back-to-back
-    attempts leave nowhere for the panel to wake up unnoticed. Aiming one net
-    at a predicted wake was fragile: every miss cost a whole cycle.
+    and latches onto the panel's first advertisement -- so the next one has to
+    open the instant the last expired, or the panel has somewhere to wake up
+    unnoticed. MIN_DELAY is a rate limit on instant failures, not pacing: an
+    attempt that already spent it must not be charged it twice.
     """
     coordinator, display = build()
     display.fail = True
@@ -377,65 +383,37 @@ async def test_keeps_the_net_open_while_online():
         await settle(coordinator)
         assert display.attempts == 1, "waited out the sleep instead of netting"
         assert coordinator.status == STATUS_PENDING
-        assert armed_delay(coordinator) == MIN_DELAY, "no cool-off after a failure"
 
-        # The cool-off delays one net; it must not become the answer forever.
-        # The bug it guards: the timer fires, re-decides the same MIN_DELAY and
-        # arms itself again, so a burst spins at 2 s and never connects at all.
+        # As if that net had run its full 20 s before failing.
+        coordinator._last_attempt = time.monotonic() - 30
         display.fail = False
-        assert fire_retry(coordinator)
+        coordinator._maybe_upload()
         await settle(coordinator)
-        assert display.attempts == 2, "the cool-off swallowed the whole burst"
+        assert display.attempts == 2, "left the panel a gap to wake up in"
     assert len(display.pushes) == 1
     assert coordinator.status == STATUS_IDLE
 
 
-async def test_burst_expires_into_a_quiet_gap():
-    """The burst is bounded, because our own connecting blinds the scanner.
+async def test_a_confirmed_upload_counts_as_a_sighting():
+    """A connection is evidence too, and at the end of a net it is the only one.
 
-    On an ESPHome proxy a pending connect takes a connection slot and stops the
-    scanning -- including the advertisements that are the only evidence the
-    panel is still there. So the nets stop after BURST and the radio is left
-    alone for a while.
+    Our own netting is what stops a proxy scanning, so the advertisement
+    history can be well past ONLINE_TTL by the time a frame lands. If that were
+    the only evidence, the next edit would find the panel "offline" seconds
+    after it answered and refuse to open a net for it.
     """
     coordinator, display = build()
-    display.fail = True
-    with seen(20):
-        await coordinator.async_set_markdown("# Hello")
-        await settle(coordinator)
-        assert armed_delay(coordinator) == MIN_DELAY
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+    assert coordinator.online is True
 
-        coordinator._burst_until = time.monotonic() - 1
-        display.attempts = 0
-        assert fire_retry(coordinator)
-        await settle(coordinator)
-    assert not display.attempts, "kept hammering past the end of the burst"
-    assert armed_delay(coordinator) == OFFLINE_POLL
-
-
-async def test_a_fresh_sighting_rearms_the_burst():
-    """A panel that is still cycling is worth another burst.
-
-    Not driven by the advertisement callback: HA suppresses this board's repeat
-    advertisements, so the tick reading the history is what has to notice.
-    """
-    coordinator, display = build()
-    display.fail = True
-    with seen(20):
-        await coordinator.async_set_markdown("# Hello")
-        await settle(coordinator)
-        coordinator._burst_until = time.monotonic() - 1
-        assert fire_retry(coordinator)
-        await settle(coordinator)
-        assert armed_delay(coordinator) == OFFLINE_POLL
-
-    # The quiet gap lets the proxy scan again, and it hears the panel.
-    with seen(10):
-        display.attempts = 0
+    with seen(ONLINE_TTL + 60):
         coordinator._async_tick(None)
+        assert coordinator.online is True, "a panel that just answered was written off"
+        await coordinator.async_set_markdown("# Second")
         await settle(coordinator)
-    assert display.attempts == 1, "a live panel was left queued"
-    assert coordinator._burst_until - time.monotonic() > BURST - 5
+    assert len(display.pushes) == 2, "refused to net a panel that had just answered"
 
 
 async def test_offline_panel_is_left_alone():
@@ -511,14 +489,14 @@ async def test_a_missed_wake_is_not_an_error():
 
 
 async def test_failure_does_not_spin():
-    # A push that fails instantly, against a sighting fresh enough to mean
-    # "awake now", would otherwise re-kick itself as fast as the event loop
-    # allows until the sighting aged out.
+    # A push that fails instantly -- no connection slot free on the proxy, no
+    # BlueZ path -- would otherwise re-kick itself as fast as the event loop
+    # allows. Only this case is rate limited; see test_nets_run_back_to_back.
     coordinator, display = build()
     display.fail = True
     await coordinator.async_set_markdown("# Hello")
     await settle(coordinator)
-    assert armed_delay(coordinator) == MIN_DELAY, "no cool-off after a failure"
+    assert armed_delay(coordinator) == MIN_DELAY, "an instant failure was not limited"
 
     # ...but an advertisement is proof the panel is up this instant, and a spin
     # does not advertise, so that outranks the cool-off.

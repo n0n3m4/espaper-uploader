@@ -42,24 +42,29 @@ Assistant is already old news — a good part of the two seconds is gone by the
 time anything can act on it. But a connect attempt is not an instant thing: the
 request stays *pending* for about twenty seconds, and the Bluetooth controller
 latches onto the panel's first advertisement in hardware. So the integration
-simply holds a net open — arming the next attempt as each one expires, every two
-seconds — and lets the panel walk into it. There is no prediction of the next
-wake: the phase of the last sighting, the learned advertising interval and the
-panel's own clock all drift, and a mis-aimed net used to cost a full cycle.
+simply holds a net open — opening the next attempt as each one expires, with no
+gap between them — and lets the panel walk into it. There is no prediction of
+the next wake: the phase of the last sighting, the learned advertising interval
+and the panel's own clock all drift, and a mis-aimed net used to cost a full
+cycle. Twenty seconds is not a choice, either: `bleak-retry-connector` and
+ESPHome's `esp32_ble` both fix a connection attempt at 20 s, on purpose, to
+match each other.
 
-The nets run for two and a half minutes before pausing for one. That is not
-politeness for its own sake: while a connect is pending, a Bluetooth proxy is not
-scanning, so the advertisements that are the only evidence the panel still exists
-never arrive. The quiet gap is what keeps `online` honest — and if the panel is
-sighted during it, another burst starts.
+The nets are not free. While a connect is pending, a Bluetooth proxy stops
+scanning — for everything behind it, not just for this panel — so a frame owed
+to a panel that is not answering costs that proxy its advertisements. What
+bounds it is the five-minute rule below, and nothing else: it is a deliberate
+trade, on the grounds that a panel which is really there is caught in a net or
+two, and the blindness ends when the frame lands.
 
 If the panel has not been heard from for five minutes it is treated as offline
 and attempts stop, leaving only the advertisement history being watched once a
 minute, which costs a dictionary lookup and no radio at all. That matters most
 with an ESPHome Bluetooth proxy: every attempt takes one of its few connection
-slots and pauses the scanning that everything else behind it depends on. The
-frame is still owed, and goes out on the first cycle after the panel returns —
-no attempt limit, nothing to retrigger by hand.
+slots as well. A connection the panel answered counts as a sighting too — by the
+time a frame lands, our own netting has usually kept the scanner from hearing
+anything for minutes. The frame is still owed, and goes out on the first cycle
+after the panel returns — no attempt limit, nothing to retrigger by hand.
 
 A `binary_sensor` reports that online/offline state, and the text entity carries
 it as the `online` and `last_seen` attributes. Text can still be set while the
@@ -384,9 +389,8 @@ Reading the state:
 
 | Symptom | Meaning |
 |---|---|
-| `next attempt in 2s` | Normal — the net is being held open, one twenty-second attempt after another, until the panel wakes into it. |
-| `upload failed: ...` then `next attempt in 2s` | Also normal: that net expired without the panel turning up. Expect a run of them. |
-| `next attempt in 60s (holding off)` | Two and a half minutes of attempts did not catch it, so the radio is being left alone for a minute — partly so the proxy can scan, and hear whether the panel is still there at all. |
+| `upload failed: ...` then `uploading ...` again | Normal — that net expired without the panel turning up, and the next one opens straight away. Expect a run of them, about twenty seconds apart. |
+| `next attempt in 2s` | The rate limit, so it is not the timeout above: something failed *instantly*. No free connection slot on the proxy, no adapter, or the panel is not in the Bluetooth stack yet. |
 | `next attempt in 60s (panel offline)` | Nothing heard from the panel for five minutes: it is off, flat, out of range, or the adapter is down. The frame stays queued and goes out when it returns. |
 | `panel online` / `panel offline` | The connectivity sensor changing state. |
 | Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |

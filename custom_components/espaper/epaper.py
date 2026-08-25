@@ -160,13 +160,19 @@ class EPaperDisplay:
         frame however this was called. Raises :class:`EPaperError` unless the
         device reports DONE.
         """
-        # One attempt only, because the coordinator aims them. Each attempt is
-        # a 20 s net -- the request stays pending and the controller latches
-        # onto the panel's first advertisement -- and the coordinator opens one
-        # just before the panel is due, so a second and third attempt would only
-        # spill into the sleep behind it. establish_connection's own retries
-        # also reuse one client, so a stale device path stays stale; the
-        # coordinator re-resolves the BLEDevice for every attempt.
+        # One attempt only, because the coordinator drives the loop: this is a
+        # 20 s net -- the request stays pending and the controller latches onto
+        # the panel's first advertisement -- and the coordinator opens the next
+        # one the moment this returns. establish_connection's own retries reuse
+        # one client, so a stale device path stays stale; the coordinator
+        # re-resolves the BLEDevice for every attempt, which is the point.
+        #
+        # The 20 s is not ours to pick, and a longer net is not a one-line
+        # change: establish_connection hardcodes client.connect(timeout=
+        # BLEAK_TIMEOUT) at 20 s (kwargs here reach the client *constructor*,
+        # not that call), and ESPHome's esp32_ble has connection_timeout,
+        # default 20 s, chosen to match aioesphomeapi and bleak-retry-connector.
+        # Both ends would have to change, including every proxy's YAML.
         client = await establish_connection(
             BleakClientWithServiceCache, device, self.address, max_attempts=1
         )
