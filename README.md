@@ -40,6 +40,13 @@ only while it actually owes the panel a frame. An update therefore lands within
 about one sleep cycle (~60 s by default), and a failed transfer simply retries on
 the next wake.
 
+Catching it means watching for it. While a frame is owed the integration checks
+every two seconds how old the last sighting of the panel is, and connects only
+when it is fresher than five seconds — the width of the wake window. A stale
+sighting means the radio is already off, and connecting to it does not fail
+fast: it holds the adapter for the whole connect timeout, which is longer than
+the window that would have worked.
+
 E-paper holds its image without power, so after a Home Assistant restart the
 integration compares the restored text with the text it last confirmed on the
 panel and stays quiet if they match.
@@ -342,7 +349,8 @@ Reading the state:
 
 | Symptom | Meaning |
 |---|---|
-| `upload failed: ...` then `retrying in 30s` | Normal while the board is asleep — it is reachable ~2 s per minute, so a few failures before a success are expected. |
+| `last advertisement 34.2s ago, panel is asleep` | Normal — the board is reachable ~2 s per minute, so most checks land in the sleep. |
+| `upload failed: ...` then `retrying upload` | Also normal: the window was caught but the connection did not complete in it. |
 | Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
 | `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
@@ -350,7 +358,8 @@ Reading the state:
 | `state=ERROR err=BAD_LENGTH` after turning on 4 colours | The firmware predates 2bpp or deflate. Flash the current build, or turn the switch off. |
 | `panel advertises 1 bpp, sending black and white` | Older firmware; harmless, and the switch stays on for when it is updated. |
 | The card is missing from the picker | Open `/espaper/espaper-card.js` in a browser tab. A 404 means the integration never registered it — the log says `dashboard card served at ...` on a good start, and warns if `www/espaper-card.js` is missing from the install. If it serves fine, it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
-| Stuck at `pending` forever | Look for the 30 s retry lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
+| Stuck at `pending` forever | Look for the `panel is asleep` lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
+| Stuck at `uploading` forever | Should be impossible: every upload failure is caught and re-armed. If it happens, the log has a traceback — please report it. |
 
 The entity's `upload_status` attribute shows the same state without touching
 the logs.

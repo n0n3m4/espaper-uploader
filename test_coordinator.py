@@ -10,12 +10,14 @@ current text, an advertisement must not cause another connection.
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from custom_components.espaper.coordinator import (  # noqa: E402
+    ADVERT_TTL,
     STATUS_IDLE,
     STATUS_PENDING,
     EPaperCoordinator,
@@ -43,10 +45,11 @@ class FakeDisplay:
     def __init__(self):
         self.pushes: list[bytes] = []
         self.fail = False
+        self.error: Exception = EPaperError("boom")
 
     async def push(self, device, payload_for, gray4=False):
         if self.fail:
-            raise EPaperError("boom")
+            raise self.error
         self.pushes.append(payload_for(400, 300, gray4))
 
 
@@ -68,6 +71,21 @@ def build() -> tuple[EPaperCoordinator, FakeDisplay]:
     coordinator.display = display
     coordinator._device = MagicMock()  # pretend the panel is already known
     return coordinator, display
+
+
+def service_info(age: float = 0.0):
+    """A sighting of the panel `age` seconds ago, as HA's history reports it."""
+    info = MagicMock()
+    info.time = time.monotonic() - age
+    return info
+
+
+def asleep(age: float = ADVERT_TTL + 25):
+    """Patch the advertisement history to say the panel went back to sleep."""
+    return patch(
+        "custom_components.espaper.coordinator.bluetooth.async_last_service_info",
+        return_value=service_info(age),
+    )
 
 
 def fire_retry(coordinator) -> bool:
@@ -320,6 +338,48 @@ async def test_retries_without_any_advertisement():
     assert coordinator.status == STATUS_IDLE
 
 
+async def test_asleep_panel_is_never_connected_to():
+    """The board is reachable ~2 s a minute; a stale sighting means it is gone.
+
+    Connecting anyway does not fail fast -- it blocks the adapter for the whole
+    connect timeout, which is longer than the next wake window, so a doomed
+    attempt costs the very window that would have worked.
+    """
+    coordinator, display = build()
+    with asleep():
+        await coordinator.async_set_markdown("# Hello")
+        await settle(coordinator)
+    assert not display.pushes, "connected to a panel that is asleep"
+    assert coordinator.status == STATUS_PENDING
+    assert coordinator._retry_unsub is not None, "no retry armed while asleep"
+
+    # ...and the moment it wakes, the frame goes out.
+    assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+
+
+async def test_unexpected_error_does_not_strand_the_status():
+    """bleak raises BleakError, which is not an OSError.
+
+    An exception escaping the upload task leaves the status at "uploading"
+    with no retry armed, and the panel never updates again until Home
+    Assistant restarts -- exactly what the card was showing.
+    """
+    coordinator, display = build()
+    display.fail = True
+    display.error = RuntimeError("le-connection-abort-by-local")
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert coordinator.status == STATUS_PENDING, coordinator.status
+    assert coordinator._retry_unsub is not None, "no retry armed after a failure"
+
+    display.fail = False
+    assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+
+
 async def test_success_arms_no_retry():
     coordinator, display = build()
     await coordinator.async_set_markdown("# Hello")
@@ -365,6 +425,12 @@ if __name__ == "__main__":
             "custom_components.espaper.coordinator.bluetooth"
             ".async_ble_device_from_address",
             return_value=None,
+        ),
+        # Awake unless a test says otherwise.
+        patch(
+            "custom_components.espaper.coordinator.bluetooth"
+            ".async_last_service_info",
+            new=lambda *args, **kwargs: service_info(),
         ),
     ):
         asyncio.run(main())

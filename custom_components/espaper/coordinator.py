@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from datetime import datetime
 
@@ -22,7 +23,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, MANUFACTURER, MODEL
-from .epaper import EPaperDisplay, EPaperError
+from .epaper import EPaperDisplay
 from .render import render_markdown
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,11 +48,17 @@ STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
 
-# Seconds between attempts while a frame is owed. The board wakes about once a
-# minute, and establish_connection keeps the radio listening across a chunk of
-# that, so a retry on this cadence lands inside a wake window soon enough
-# without holding the adapter busy the whole time.
-RETRY_DELAY = 30
+# Seconds between attempts while a frame is owed. The board advertises for two
+# seconds a minute, so the window has to be caught rather than waited for: this
+# is a poll of the bluetooth stack's advertisement history, not of the radio,
+# so it costs a dict lookup and can afford to be this fast.
+RETRY_DELAY = 2
+
+# How old the last advertisement may be for the panel to still be worth
+# connecting to. It advertises for ~2 s and then the radio is off until the
+# next wake, so anything staler than this is a connection attempt that can only
+# end in a 20 s timeout -- during which the next window would be missed too.
+ADVERT_TTL = 5
 
 
 class EPaperCoordinator:
@@ -236,11 +243,39 @@ class EPaperCoordinator:
         self._maybe_upload()
 
     @callback
+    def _awake(self) -> bool:
+        """Whether the panel's last advertisement is fresh enough to connect.
+
+        The board is only reachable inside its own advertising window, so a
+        stale sighting means the radio is already off and a connect would just
+        burn twenty seconds of adapter time to find that out. Never having seen
+        an advertisement at all is different: that is a blind first attempt,
+        which is the only way to bootstrap.
+        """
+        info = bluetooth.async_last_service_info(
+            self.hass, self.address, connectable=True
+        )
+        if info is None:
+            return True
+        age = time.monotonic() - info.time
+        if age > ADVERT_TTL:
+            _LOGGER.debug(
+                "espaper %s: last advertisement %.1fs ago, panel is asleep",
+                self.address,
+                age,
+            )
+            return False
+        return True
+
+    @callback
     def _maybe_upload(self) -> None:
         if self.status != STATUS_PENDING:
             return
         if self._task is not None and not self._task.done():
             _LOGGER.debug("espaper %s: upload already in flight", self.address)
+            return
+        if not self._awake():
+            self._schedule_retry()
             return
         self._cancel_retry()
         self._task = self.entry.async_create_background_task(
@@ -264,9 +299,6 @@ class EPaperCoordinator:
             _LOGGER.debug("espaper %s: retrying upload", self.address)
             self._maybe_upload()
 
-        _LOGGER.debug(
-            "espaper %s: retrying in %ds", self.address, RETRY_DELAY
-        )
         self._retry_unsub = async_call_later(self.hass, RETRY_DELAY, _retry)
 
     async def _async_upload(self) -> None:
@@ -306,9 +338,13 @@ class EPaperCoordinator:
                 lambda w, h, g: render_markdown(text, (w, h), g, rotation),
                 gray4,
             )
-        except (EPaperError, TimeoutError, OSError) as err:
+        except Exception as err:  # noqa: BLE001
             # Expected while the board is in its ~60 s deep sleep: it is only
-            # reachable for about two seconds per cycle.
+            # reachable for about two seconds per cycle. Deliberately every
+            # exception, not a tuple: bleak raises BleakError, which descends
+            # from Exception and not from OSError, and anything escaping this
+            # background task strands the status at "uploading" with no retry
+            # armed -- the panel then never updates again until a restart.
             _LOGGER.debug("espaper %s: upload failed: %s", self.address, err)
             self.last_error = str(err)
             self.status = STATUS_PENDING

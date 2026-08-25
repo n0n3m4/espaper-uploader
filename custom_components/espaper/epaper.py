@@ -160,8 +160,14 @@ class EPaperDisplay:
         frame however this was called. Raises :class:`EPaperError` unless the
         device reports DONE.
         """
+        # One attempt only. establish_connection's default is four, each with
+        # a 20 s timeout, and the panel is reachable for about two seconds per
+        # minute: attempts two through four are guaranteed to be talking to a
+        # radio that is already off, and they hold the adapter -- and the
+        # "uploading" status -- across the next wake window as well. The
+        # coordinator retries instead, as soon as it sees a fresh advertisement.
         client = await establish_connection(
-            BleakClientWithServiceCache, device, self.address
+            BleakClientWithServiceCache, device, self.address, max_attempts=1
         )
         try:
             width, height, bpp, sleep_s = await self._read_info(client)
