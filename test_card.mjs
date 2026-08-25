@@ -19,7 +19,7 @@ globalThis.HTMLElement = class {
   }
 };
 
-const { ESPaperCard, nextValue } = await import(
+const { ESPaperCard, nextValue, sendPlan } = await import(
   "./custom_components/espaper/www/espaper-card.js"
 );
 
@@ -53,6 +53,31 @@ const cases = {
   "clearing the text remotely is a change like any other": () => {
     assert.equal(nextValue("", "# Shopping", "# Shopping", false), "");
     assert.equal(nextValue("", "# Shopping", "mine", true), "mine");
+  },
+
+  "Send with nothing changed sends nothing": () => {
+    assert.deepEqual(sendPlan("# Hello", "# Hello", 90, 90), []);
+  },
+
+  "Send with only the text changed leaves the angle alone": () => {
+    assert.deepEqual(sendPlan("# Bye", "# Hello", 90, 90), [
+      ["set_markdown", { markdown: "# Bye" }],
+    ]);
+  },
+
+  "Send with only the angle changed leaves the text alone": () => {
+    assert.deepEqual(sendPlan("# Hello", "# Hello", 180, 90), [
+      ["set_rotation", { rotation: 180 }],
+    ]);
+  },
+
+  "both changed go out together, markdown first": () => {
+    // The whole bug: rotation used to go on its own, repainting the panel at
+    // the new angle with text that had never been sent.
+    assert.deepEqual(sendPlan("# Bye", "# Hello", 180, 90), [
+      ["set_markdown", { markdown: "# Bye" }],
+      ["set_rotation", { rotation: 180 }],
+    ]);
   },
 };
 

@@ -38,6 +38,22 @@ export function nextValue(remote, lastRemote, current, dirty) {
   return remote;
 }
 
+/**
+ * Which services Send must call.
+ *
+ * The frame on the panel depends on both the text and the angle, and each
+ * service kicks its own upload, so an unchanged one is left out rather than
+ * re-sent. Markdown goes first: if both changed, the coordinator may start an
+ * upload before the second call lands, and a transient frame of new text at the
+ * old angle beats one of old text at the new angle.
+ */
+export function sendPlan(text, remoteText, rotation, remoteRotation) {
+  const calls = [];
+  if (text !== remoteText) calls.push(["set_markdown", { markdown: text }]);
+  if (rotation !== remoteRotation) calls.push(["set_rotation", { rotation }]);
+  return calls;
+}
+
 /** "3 minutes ago", or "never" for a panel that has not been written yet. */
 function ago(iso) {
   if (!iso) return "never";
@@ -60,7 +76,9 @@ export class ESPaperCard extends Base {
   constructor() {
     super();
     this._remote = null;
+    this._remoteRotation = null;
     this._dirty = false;
+    this._rotationDirty = false;
     this._external = false; // changed elsewhere while we held unsaved edits
     this._sending = false;
     this._error = null;
@@ -190,7 +208,11 @@ export class ESPaperCard extends Base {
       }
     });
     this._button.addEventListener("click", () => this._send());
-    this._rotate.addEventListener("change", () => this._setRotation());
+    this._rotate.addEventListener("change", () => {
+      this._rotationDirty = Number(this._rotate.value) !== this._remoteRotation;
+      this._error = null;
+      this._paint();
+    });
   }
 
   _update() {
@@ -212,6 +234,20 @@ export class ESPaperCard extends Base {
       );
       if (remote !== this._remote) this._external = this._dirty;
       this._remote = remote;
+
+      // The dropdown is a draft too, so it needs the same rule: adopt a change
+      // from elsewhere only when it would not throw away an unsent selection.
+      const remoteRotation = state.attributes.rotation ?? 0;
+      this._rotate.value = nextValue(
+        String(remoteRotation),
+        String(this._remoteRotation),
+        this._rotate.value,
+        this._rotationDirty,
+      );
+      if (remoteRotation !== this._remoteRotation && this._rotationDirty) {
+        this._external = true;
+      }
+      this._remoteRotation = remoteRotation;
     }
     this._state = state;
     this._paint();
@@ -220,8 +256,9 @@ export class ESPaperCard extends Base {
   _paint() {
     const attrs = this._state?.attributes ?? {};
     const notes = [];
+    const pending = this._dirty || this._rotationDirty;
     if (this._sending) notes.push("sending…");
-    else if (this._dirty) notes.push("unsaved changes");
+    else if (pending) notes.push("unsaved changes");
     if (this._external) notes.push("changed elsewhere");
 
     const problem = this._error ?? attrs.last_error;
@@ -233,47 +270,31 @@ export class ESPaperCard extends Base {
       notes.push(`${attrs.upload_status ?? "idle"} · panel updated ${ago(attrs.last_upload)}`);
     }
 
-    // Rotation lives in Home Assistant, not here: no local draft to protect,
-    // so the dropdown just mirrors the attribute.
-    this._rotate.value = String(attrs.rotation ?? 0);
     this._status.textContent = notes.join(" · ");
     this._status.classList.toggle("error", Boolean(problem));
-    this._button.disabled = this._sending || !this._dirty;
-  }
-
-  async _setRotation() {
-    if (!this._hass) return;
-    this._error = null;
-    try {
-      await this._hass.callService(
-        DOMAIN,
-        "set_rotation",
-        { rotation: Number(this._rotate.value) },
-        { entity_id: this._config.entity },
-      );
-    } catch (err) {
-      this._error = err?.message || String(err);
-    }
-    this._paint();
+    this._button.disabled = this._sending || !pending;
   }
 
   async _send() {
     if (this._sending || !this._hass) return;
     const sending = this._textarea.value;
+    const rotation = Number(this._rotate.value);
     this._sending = true;
     this._error = null;
     this._paint();
     try {
-      await this._hass.callService(
-        DOMAIN,
-        "set_markdown",
-        { markdown: sending },
-        { entity_id: this._config.entity },
-      );
-      // Adopt it locally too, so the state update this causes is not treated
-      // as a change from elsewhere.
+      const calls = sendPlan(sending, this._remote, rotation, this._remoteRotation);
+      for (const [service, data] of calls) {
+        await this._hass.callService(DOMAIN, service, data, {
+          entity_id: this._config.entity,
+        });
+      }
+      // Adopt them locally too, so the state updates this causes are not
+      // treated as changes from elsewhere.
       this._remote = sending;
+      this._remoteRotation = rotation;
       this._dirty = this._textarea.value !== sending;
+      this._rotationDirty = Number(this._rotate.value) !== rotation;
       this._external = false;
     } catch (err) {
       this._error = err?.message || String(err);
