@@ -462,6 +462,24 @@ async def test_online_flag_ages_out_on_the_tick():
     assert updates == [True, False, True]
 
 
+async def test_a_missed_wake_is_not_an_error():
+    # The card shows last_error in red. A connect that never landed is what
+    # happens most cycles, and saying so there reads like a fault; only the
+    # panel answering and refusing the frame is one.
+    coordinator, display = build()
+    display.fail = True
+    display.error = TimeoutError("Timeout waiting for connect response after 20s")
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert coordinator.status == STATUS_PENDING
+    assert coordinator.last_error is None, "a missed wake was reported as a fault"
+
+    display.error = EPaperError("state=ERROR err=CRC_MISMATCH received=15000")
+    assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert coordinator.last_error == "state=ERROR err=CRC_MISMATCH received=15000"
+
+
 async def test_failure_does_not_spin():
     # A push that fails instantly, against a sighting fresh enough to mean
     # "awake now", would otherwise re-kick itself as fast as the event loop

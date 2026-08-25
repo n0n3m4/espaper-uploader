@@ -29,7 +29,7 @@ from homeassistant.helpers.event import async_call_later, async_track_time_inter
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, MANUFACTURER, MODEL
-from .epaper import EPaperDisplay
+from .epaper import EPaperDisplay, EPaperError
 from .render import render_markdown
 
 _LOGGER = logging.getLogger(__name__)
@@ -431,7 +431,12 @@ class EPaperCoordinator:
             # background task strands the status at "uploading" with no retry
             # armed -- the panel then never updates again until a restart.
             _LOGGER.debug("espaper %s: upload failed: %s", self.address, err)
-            self.last_error = str(err)
+            # Not catching the panel is the normal case -- it is connectable for
+            # about two seconds a minute -- so a connect that timed out is not
+            # worth painting the card red over. An EPaperError is different: the
+            # panel answered and the frame was refused. The offline sensor is
+            # what says the panel is genuinely not there.
+            self.last_error = str(err) if isinstance(err, EPaperError) else None
             self.status = STATUS_PENDING
             self._cooling_off = True
         else:
