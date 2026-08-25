@@ -47,15 +47,20 @@ FONT_BOLD = FONT_DIR / "NotoSans-SemiCondensedSemiBold.ttf"
 # solid.
 INK_CUTOFF = 160
 
-# Luminance of each 2bpp wire level, level 0 first. Measured off the panel with
-# black and white pinned to true black and white; the two greys are nowhere near
+# Luminance of each 2bpp wire level, level 0 first. Measured off the panel: even
+# the extremes are paper grey and grey ink, not 255 and 0. The greys are nowhere near
 # evenly spaced, which is exactly why quantising has to work against these
 # numbers rather than a linear ramp. Film-specific -- retune here if a later
 # batch of panels measures differently. Same table as tools/epaper_push.py.
-GRAY_LEVELS = (255, 202, 80, 0)
+GRAY_LEVELS = (210, 180, 100, 40)
 
-BODY_SIZE = 14
-HEADING_SIZES = {1: 26, 2: 22, 3: 18}
+# Fractional on purpose. A stem lands where the outline falls -- the bundled
+# face is ttfautohint output, which emits no horizontal instructions -- so the
+# size decides whether stems agree with each other, and it is not monotonic:
+# 16.375 holds stem-to-stem variation near 5.5% where 16.0 is 8.7% and 17.0 is
+# 7.0%, all three at the same 21 px pitch. See CLAUDE.md before retuning.
+BODY_SIZE = 16.375
+HEADING_SIZES = {1: 29.75, 2: 26, 3: 21}
 # A panel this small looks cramped rather than dense with a hairline margin.
 MARGIN = 13
 # Air above a heading that follows something. Grouping a heading with the text
@@ -79,12 +84,12 @@ _INLINE = re.compile(r"(\*\*.+?\*\*|__.+?__|\*.+?\*|_.+?_|`.+?`)", re.DOTALL)
 
 
 @lru_cache(maxsize=32)
-def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
+def _font(bold: bool, size: float) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(str(FONT_BOLD if bold else FONT_REGULAR), size)
 
 
 @lru_cache(maxsize=32)
-def _metrics(size: int) -> tuple[int, int, int]:
+def _metrics(size: float) -> tuple[int, int, int]:
     """Return ``(pitch, ink_top, ink_bottom)`` for a font size.
 
     Pillow anchors ``draw.text`` at the ascender, not at the ink, so laying
@@ -272,8 +277,9 @@ def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
         mark_w = font.getlength("…")
         x0 = width - MARGIN - mark_w
         # Clear a patch first: the clipped line may already occupy this corner.
-        draw.rectangle((x0 - 4, bottom - BODY_SIZE - 2, width, height), fill=255)
-        draw.text((x0, bottom - BODY_SIZE), "…", font=font, fill=0)
+        # int(): a fractional y would put this one glyph on a subpixel origin.
+        draw.rectangle((x0 - 4, bottom - int(BODY_SIZE) - 2, width, height), fill=255)
+        draw.text((x0, bottom - int(BODY_SIZE)), "…", font=font, fill=0)
 
     return canvas
 
@@ -291,11 +297,23 @@ def render_image(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
 def quantize_gray4(canvas: Image.Image, levels=GRAY_LEVELS) -> bytes:
     """Map a mode-"L" canvas to one wire level (0..3) per pixel, row-major.
 
-    Nearest level by luminance, with no error diffusion: dithering is for
-    photographs, and on text it would scatter noise through every glyph edge
-    that antialiasing just placed deliberately.
+    Nearest level with no error diffusion: dithering is for photographs, and on
+    text it would scatter noise through every glyph edge that antialiasing just
+    placed deliberately.
+
+    The canvas value is read as coverage between the panel's real black and
+    white, not as an absolute luminance, because that is what an antialiased
+    edge pixel means -- v parts paper out of 255, the rest ink. Those ends are
+    40 and 210, so without the rescale everything outside that span collapses
+    into the two end levels and a 0..255 ramp comes out with its widest bands at
+    the extremes. `tools/epaper_push.py` keeps the same mapping behind
+    `--normalize`, off by default, because a photograph is not a coverage map.
     """
-    table = [min(range(4), key=lambda i: abs(v - levels[i])) for v in range(256)]
+    black, white = levels[3], levels[0]
+    table = [
+        min(range(4), key=lambda i: abs(black + v * (white - black) / 255 - levels[i]))
+        for v in range(256)
+    ]
     return canvas.point(table, mode="L").tobytes()
 
 

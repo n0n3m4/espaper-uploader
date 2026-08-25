@@ -87,8 +87,9 @@ entity: text.espaper_markdown
 ```
 
 A real textarea, no length cap, with the upload status and a rotation dropdown
-underneath. Ctrl+Enter (⌘+Enter on a Mac) sends. If you edit the text somewhere else while you have
-unsaved changes open, the card says so rather than overwriting what you typed.
+underneath. Ctrl+Enter (⌘+Enter on a Mac) sends both. If you edit the text or
+the angle somewhere else while you have unsaved changes open, the card says so
+rather than overwriting what you typed.
 
 The integration serves the card itself, so there is no Lovelace resource to add
 and nothing extra to install. If it does not appear, hard-refresh the browser;
@@ -150,9 +151,15 @@ a panel hung on its side or upside down. A quarter turn lays the text out at
 300×400 — wrapping, margins and the clipping mark all follow the shape you are
 actually reading — and the frame is turned back to the panel's own 400×300 on
 the way out, so the firmware never learns about it. The choice survives a
-restart, and changing it repaints straight away.
+restart.
 
-From an automation, or *Developer Tools → Actions*:
+In the card the dropdown is part of the draft, like the textarea: moving it says
+*unsaved changes* and one **Send** commits the text and the angle together. That
+is deliberate — a dropdown that repainted on `change` would send the angle you
+picked with the wording you had not sent yet.
+
+The service has no draft to wait for, so it repaints straight away. From an
+automation, or *Developer Tools → Actions*:
 
 ```yaml
       - action: espaper.set_rotation
@@ -169,6 +176,67 @@ onto them: **on by default**, which is `switch.espaper_4_colours`. Turn it off
 for black and white — hard-edged glyphs, and half the bytes. Either way the
 frame is repainted immediately, and a board whose firmware only reports 1 bpp
 gets black and white whatever the switch says.
+
+### Letting an LLM read and write the note
+
+[extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation)
+can drive the note through two of its custom functions — one to read, one to
+write. Paste this into **Settings → Devices & Services → Extended OpenAI
+Conversation → Configure → Functions**:
+
+```yaml
+- spec:
+    name: get_notes
+    description: Read the full text currently shown on the e-paper note.
+    parameters:
+      type: object
+      properties: {}
+  function:
+    type: template
+    value_template: "{{ state_attr('text.espaper_markdown', 'full_markdown') }}"
+
+- spec:
+    name: set_notes
+    description: >-
+      Replace the entire e-paper note. Markdown, newlines allowed. This
+      overwrites everything, so call get_notes first when adding to or
+      editing what is already there.
+    parameters:
+      type: object
+      properties:
+        markdown:
+          type: string
+          description: "Full note in Markdown: # headings, - bullets, **bold**."
+      required: [markdown]
+  function:
+    type: script
+    sequence:
+      - action: espaper.set_markdown
+        target:
+          entity_id: text.espaper_markdown
+        data:
+          markdown: "{{ markdown }}"
+```
+
+Change `text.espaper_markdown` to your own entity id if the device was named
+something else.
+
+Read goes through the `full_markdown` attribute rather than the state because
+the state is capped at 255 characters, and write goes through `espaper.set_markdown`
+rather than `text.set_value` for the same reason. If you keep the stock
+`execute_services` function alongside these, tell the model in the prompt to
+use `set_notes` for the panel — otherwise it will sometimes reach for
+`text.set_value` and silently truncate a long list.
+
+**On template injection.** A note containing `{{ ... }}` is not a hole: the
+argument is substituted into `{{ markdown }}` in a single render pass, and
+Jinja does not re-render its own output, so the braces reach the panel as
+literal text. Note content never becomes template *source* anywhere in this
+path. The risk that is real is prompt injection in the other direction —
+`get_notes` feeds the note back to the model, so anyone who can write a note
+(including the model itself, and anything an automation pastes in) can put
+instructions in front of it. That matters only in proportion to what else the
+conversation agent is allowed to call.
 
 ## Supported Markdown
 
@@ -205,9 +273,21 @@ differs between the two depths. Three things matter more than they look like
 they should:
 
 - In 4 colours the canvas is quantised to the levels the panel actually
-  produces — **255, 202, 80, 0**, measured, and nowhere near evenly spaced.
+  produces — **210, 180, 100, 40**, measured, and nowhere near evenly spaced.
   Nearest level per pixel, no dithering: error diffusion is for photographs,
   and on text it only scatters noise through the edges antialiasing just placed.
+  The canvas value is read as *coverage* between 40 and 210 rather than as an
+  absolute luminance, because that is what an antialiased edge pixel means —
+  so many parts paper, the rest ink. Without it, everything darker or lighter
+  than the panel can reproduce piles up on the two end levels.
+- Body text is **16.375 px**, and the fraction is not a typo. The bundled face
+  is ttfautohint output, which carries no horizontal hinting, so whether a
+  vertical stem lands on the pixel grid is decided by the size alone — and not
+  monotonically. Stem-to-stem variation is ~5.5 % at 16.375 against 8.7 % at
+  16.0 and 7.0 % at 17.0, all three at the same 21 px pitch and the same 13
+  lines per panel, so the fraction is free. Headings follow at 29.75 / 26 / 21
+  on the same basis. `CLAUDE.md` has the measurement method; don't retune these
+  by eye.
 - In black and white the same canvas is thresholded at 160, not 128. Biasing
   above mid-grey turns marginal edge pixels into ink, which thickens stems
   slightly instead of eroding them. That compensation is exactly what 4 colours

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "custom_components" / "espaper"))
 
 from render import (  # noqa: E402
+    GRAY_LEVELS,
     pack_1bpp,
     pack_2bpp,
     quantize_gray4,
@@ -69,9 +70,11 @@ def test_gray4_roundtrip():
     levels = quantize_gray4(render_canvas(SAMPLE, SIZE))
     assert max(levels) <= 3
     painted = unpack_2bpp(pack_2bpp(levels), SIZE)
-    # Every pixel comes back as the luminance its level stands for.
+    # Every pixel comes back as the luminance its level stands for. Not
+    # re-quantised: quantize_gray4 reads canvas coverage, and `painted` is
+    # already in panel luminance, so the two are not the same space.
     assert len(painted.tobytes()) == SIZE[0] * SIZE[1]
-    assert quantize_gray4(painted) == levels
+    assert painted.tobytes() == bytes(GRAY_LEVELS[v] for v in levels)
 
 
 def test_rotation_fills_the_same_frame():
