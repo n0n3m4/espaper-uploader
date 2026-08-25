@@ -248,21 +248,24 @@ class EPaperCoordinator:
 
         The board is only reachable inside its own advertising window, so a
         stale sighting means the radio is already off and a connect would just
-        burn twenty seconds of adapter time to find that out. Never having seen
-        an advertisement at all is different: that is a blind first attempt,
-        which is the only way to bootstrap.
+        burn twenty seconds of adapter time to find that out.
+
+        No sighting at all counts as asleep, not as a reason to try blind: Home
+        Assistant drops a device from its advertisement history once it has
+        been quiet for a while, so a panel that is off or out of range ends up
+        here, and this retries every couple of seconds forever. A blind attempt
+        could only reach the board through a cached BLEDevice from an old
+        advertisement anyway, which this firmware never answers.
         """
         info = bluetooth.async_last_service_info(
             self.hass, self.address, connectable=True
         )
-        if info is None:
-            return True
-        age = time.monotonic() - info.time
-        if age > ADVERT_TTL:
+        age = None if info is None else time.monotonic() - info.time
+        if age is None or age > ADVERT_TTL:
             _LOGGER.debug(
-                "espaper %s: last advertisement %.1fs ago, panel is asleep",
+                "espaper %s: last advertisement %s, panel is asleep",
                 self.address,
-                age,
+                "never" if age is None else f"{age:.1f}s ago",
             )
             return False
         return True

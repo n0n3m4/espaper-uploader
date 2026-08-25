@@ -353,6 +353,19 @@ async def test_asleep_panel_is_never_connected_to():
     assert coordinator.status == STATUS_PENDING
     assert coordinator._retry_unsub is not None, "no retry armed while asleep"
 
+    # A panel HA has not heard from at all is asleep too, not an invitation to
+    # try blind: it drops a quiet device from its advertisement history, so an
+    # unplugged panel lands here and would otherwise hold the adapter for a
+    # 20 s connect timeout every couple of seconds, forever.
+    with patch(
+        "custom_components.espaper.coordinator.bluetooth.async_last_service_info",
+        return_value=None,
+    ):
+        assert fire_retry(coordinator)
+        await settle(coordinator)
+    assert not display.pushes, "connected to a panel HA has never seen"
+    assert coordinator._retry_unsub is not None
+
     # ...and the moment it wakes, the frame goes out.
     assert fire_retry(coordinator)
     await settle(coordinator)

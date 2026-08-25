@@ -45,7 +45,14 @@ every two seconds how old the last sighting of the panel is, and connects only
 when it is fresher than five seconds — the width of the wake window. A stale
 sighting means the radio is already off, and connecting to it does not fail
 fast: it holds the adapter for the whole connect timeout, which is longer than
-the window that would have worked.
+the window that would have worked. No sighting at all counts as asleep too —
+Home Assistant forgets a device that has been quiet for a while, and a panel
+that is off or out of range must not be hammered.
+
+The check itself is free (it reads Home Assistant's advertisement history, not
+the radio), so it simply keeps going until the panel confirms the frame. An
+update queued against a panel that is switched off lands whenever it comes
+back, with no attempt limit and nothing to retrigger by hand.
 
 E-paper holds its image without power, so after a Home Assistant restart the
 integration compares the restored text with the text it last confirmed on the
@@ -350,6 +357,7 @@ Reading the state:
 | Symptom | Meaning |
 |---|---|
 | `last advertisement 34.2s ago, panel is asleep` | Normal — the board is reachable ~2 s per minute, so most checks land in the sleep. |
+| `last advertisement never, panel is asleep`, repeating | Home Assistant is not hearing the board at all: it is off, out of range, or the adapter is down. The upload stays queued and goes out when it returns. |
 | `upload failed: ...` then `retrying upload` | Also normal: the window was caught but the connection did not complete in it. |
 | Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
