@@ -20,6 +20,11 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "connectivity": {
+        "name": "Panel"
+      }
+    },
     "switch": {
       "gray4": {
         "name": "4 colours"

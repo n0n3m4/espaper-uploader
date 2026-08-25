@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 from .coordinator import EPaperCoordinator
 from .frontend import async_register_card
 
-PLATFORMS = [Platform.SWITCH, Platform.TEXT]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SWITCH, Platform.TEXT]
 
 type EPaperConfigEntry = ConfigEntry[EPaperCoordinator]
 

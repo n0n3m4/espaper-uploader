@@ -1,9 +1,15 @@
 """Renders Markdown and pushes it the next time the panel wakes.
 
 The board advertises for ~2 s and then deep-sleeps ~60 s, so an upload cannot
-be scheduled -- it has to be opportunistic. Every advertisement Home Assistant
-sees is a chance to connect; the coordinator takes that chance only while an
-upload is actually outstanding.
+be scheduled against the panel -- but it can be aimed. A connect attempt is a
+20 s net rather than an instant: the controller holds the request pending and
+latches onto the peer's first advertisement in hardware. So the coordinator
+opens that net a few seconds before the panel is next due, instead of reacting
+to an advertisement it has already been told about a second or two too late.
+
+It does that only while an upload is outstanding, and only while the panel is
+online -- a connection attempt is not free on an ESPHome Bluetooth proxy, which
+has a handful of connection slots and stops scanning while it opens one.
 """
 
 from __future__ import annotations
@@ -12,14 +18,14 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bleak.backends.device import BLEDevice
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, MANUFACTURER, MODEL
@@ -48,17 +54,27 @@ STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
 
-# Seconds between attempts while a frame is owed. The board advertises for two
-# seconds a minute, so the window has to be caught rather than waited for: this
-# is a poll of the bluetooth stack's advertisement history, not of the radio,
-# so it costs a dict lookup and can afford to be this fast.
-RETRY_DELAY = 2
+# Aiming the next attempt. The panel keeps a fixed duty cycle, so the last
+# sighting says when the next one is due; the attempt opens LEAD seconds before
+# that, and bleak's own 20 s connect timeout keeps it open well past it. LEAD is
+# the knob: the net covers a wake from LEAD seconds early to 20 - LEAD seconds
+# late, which is what absorbs the panel's clock drift, its render time, and a
+# proxy's batching of advertisements.
+CYCLE_FALLBACK = 62  # 2 s advertising + 60 s sleep, until HA has learned it
+LEAD = 8
+# A sighting this fresh means the panel is probably awake this second, so there
+# is nothing to wait for.
+INSIDE_WINDOW = 3
+# ...but never two attempts closer together than this, or a push that fails
+# instantly spins.
+MIN_DELAY = 2
 
-# How old the last advertisement may be for the panel to still be worth
-# connecting to. It advertises for ~2 s and then the radio is off until the
-# next wake, so anything staler than this is a connection attempt that can only
-# end in a 20 s timeout -- during which the next window would be missed too.
-ADVERT_TTL = 5
+# Five missed wake cycles. Past this the panel is off, flat or out of range, and
+# attempts stop: on an ESPHome proxy each one occupies one of about three
+# connection slots and pauses the scanning everything else on it depends on.
+# Only the (free) advertisement history is watched, on this cadence.
+ONLINE_TTL = 300
+OFFLINE_POLL = 60
 
 
 class EPaperCoordinator:
@@ -82,7 +98,12 @@ class EPaperCoordinator:
         self.status = STATUS_IDLE
         self.last_error: str | None = None
         self.last_upload: datetime | None = None
+        # Whether the panel has been heard from recently enough to be worth
+        # connecting to. Not whether it is awake -- it almost never is.
+        self.online = False
+        self.last_seen: datetime | None = None
 
+        self._cooling_off = False
         self._device: BLEDevice | None = None
         self._task: asyncio.Task | None = None
         self._retry_unsub: Callable[[], None] | None = None
@@ -103,7 +124,7 @@ class EPaperCoordinator:
     # ---------------------------------------------------------------- setup
 
     async def async_start(self) -> None:
-        """Subscribe to advertisements from this panel."""
+        """Subscribe to advertisements from this panel, and start the clock."""
         # Seed with whatever the bluetooth stack already knows, in case the
         # board is awake right now.
         self._device = bluetooth.async_ble_device_from_address(
@@ -119,6 +140,16 @@ class EPaperCoordinator:
                 bluetooth.BluetoothScanningMode.ACTIVE,
             )
         )
+        # Going offline is the passage of time, not an event, and HA suppresses
+        # this board's repeat advertisements -- so nothing else would ever
+        # notice. Doubles as the backstop for a frame owed to a panel that is
+        # not answering.
+        self._unsubs.append(
+            async_track_time_interval(
+                self.hass, self._async_tick, timedelta(seconds=OFFLINE_POLL)
+            )
+        )
+        self._refresh_online()
 
     async def async_stop(self) -> None:
         """Unsubscribe and cancel any upload in flight."""
@@ -232,43 +263,77 @@ class EPaperCoordinator:
         advertisement whose name, service UUIDs, service data and manufacturer
         data all match the previous one, and this board advertises a constant
         payload, so after the first sighting this callback essentially stops
-        firing. It is kept because it makes the first upload after a text
-        change immediate when the panel happens to be awake; _schedule_retry
-        is what actually guarantees delivery.
+        firing. It is kept because when it does fire the panel is awake this
+        instant, which beats any prediction; _schedule_retry is what actually
+        guarantees delivery.
         """
         self._device = service_info.device
         _LOGGER.debug(
             "espaper %s: advertisement seen, status=%s", self.address, self.status
         )
+        # Proof the panel is up this instant, which outranks the cool-off after
+        # a failure -- that exists to stop a spin, and a spin does not advertise.
+        self._cooling_off = False
+        self._refresh_online()
         self._maybe_upload()
 
     @callback
-    def _awake(self) -> bool:
-        """Whether the panel's last advertisement is fresh enough to connect.
+    def _last_seen(self) -> float | None:
+        """Seconds since a connectable scanner last heard this panel.
 
-        The board is only reachable inside its own advertising window, so a
-        stale sighting means the radio is already off and a connect would just
-        burn twenty seconds of adapter time to find that out.
-
-        No sighting at all counts as asleep, not as a reason to try blind: Home
-        Assistant drops a device from its advertisement history once it has
-        been quiet for a while, so a panel that is off or out of range ends up
-        here, and this retries every couple of seconds forever. A blind attempt
-        could only reach the board through a cached BLEDevice from an old
-        advertisement anyway, which this firmware never answers.
+        ``None`` if there is no sighting at all -- HA drops a device from its
+        advertisement history once it has been quiet for long enough, so this
+        is also where a panel that has been off for a while ends up.
         """
         info = bluetooth.async_last_service_info(
             self.hass, self.address, connectable=True
         )
-        age = None if info is None else time.monotonic() - info.time
-        if age is None or age > ADVERT_TTL:
-            _LOGGER.debug(
-                "espaper %s: last advertisement %s, panel is asleep",
-                self.address,
-                "never" if age is None else f"{age:.1f}s ago",
-            )
-            return False
-        return True
+        if info is None:
+            return None
+        return time.monotonic() - info.time
+
+    @callback
+    def _refresh_online(self) -> None:
+        """Recompute whether the panel counts as present, and say so if it changed."""
+        age = self._last_seen()
+        if age is not None:
+            self.last_seen = dt_util.utcnow() - timedelta(seconds=age)
+        online = age is not None and age <= ONLINE_TTL
+        if online == self.online:
+            return
+        self.online = online
+        _LOGGER.debug(
+            "espaper %s: panel %s", self.address, "online" if online else "offline"
+        )
+        self._notify()
+
+    @callback
+    def _next_attempt_delay(self) -> float | None:
+        """Seconds to wait before the attempt most likely to catch the panel.
+
+        ``None`` while the panel is offline: there is nothing worth connecting
+        to, and on a proxy an attempt costs a connection slot and a pause in
+        scanning that every other device behind it pays for.
+
+        Otherwise the panel is assumed to be keeping its duty cycle, so the next
+        wake is one cycle on from the last sighting -- or several, if sightings
+        have been missed, which is why this works off the phase rather than the
+        raw age. The attempt opens LEAD seconds ahead of it.
+        """
+        age = self._last_seen()
+        if age is None or age > ONLINE_TTL:
+            return None
+        if age <= INSIDE_WINDOW:
+            # Awake right now, most likely, so go -- unless the last attempt
+            # failed and nothing has happened since, because a push that fails
+            # instantly would otherwise re-kick itself as fast as the event loop
+            # allows until the sighting aged out.
+            return MIN_DELAY if self._cooling_off else 0.0
+        cycle = (
+            bluetooth.async_get_learned_advertising_interval(self.hass, self.address)
+            or CYCLE_FALLBACK
+        )
+        return max(MIN_DELAY, cycle - (age % cycle) - LEAD)
 
     @callback
     def _maybe_upload(self) -> None:
@@ -277,7 +342,7 @@ class EPaperCoordinator:
         if self._task is not None and not self._task.done():
             _LOGGER.debug("espaper %s: upload already in flight", self.address)
             return
-        if not self._awake():
+        if (delay := self._next_attempt_delay()) is None or delay > 0:
             self._schedule_retry()
             return
         self._cancel_retry()
@@ -293,16 +358,33 @@ class EPaperCoordinator:
 
     @callback
     def _schedule_retry(self) -> None:
-        """Try again on a timer, since another advertisement may never come."""
+        """Arm the next attempt, aimed at the panel's next predicted wake."""
         self._cancel_retry()
 
         @callback
         def _retry(_now) -> None:
             self._retry_unsub = None
-            _LOGGER.debug("espaper %s: retrying upload", self.address)
+            # Whatever we were waiting out, we have now waited it out.
+            self._cooling_off = False
             self._maybe_upload()
 
-        self._retry_unsub = async_call_later(self.hass, RETRY_DELAY, _retry)
+        delay = self._next_attempt_delay()
+        _LOGGER.debug(
+            "espaper %s: next attempt in %.0fs%s",
+            self.address,
+            OFFLINE_POLL if delay is None else delay,
+            " (panel offline)" if delay is None else "",
+        )
+        if delay is None:
+            delay = OFFLINE_POLL
+        self._retry_unsub = async_call_later(self.hass, delay, _retry)
+
+    @callback
+    def _async_tick(self, _now) -> None:
+        """Age the online flag out, and un-wedge a frame with nothing armed."""
+        self._refresh_online()
+        if self._retry_unsub is None:
+            self._maybe_upload()
 
     async def _async_upload(self) -> None:
         """One upload attempt for whatever the text says right now."""
@@ -351,6 +433,7 @@ class EPaperCoordinator:
             _LOGGER.debug("espaper %s: upload failed: %s", self.address, err)
             self.last_error = str(err)
             self.status = STATUS_PENDING
+            self._cooling_off = True
         else:
             self.uploaded_markdown = sending
             self.uploaded_gray4 = gray4
@@ -371,11 +454,10 @@ class EPaperCoordinator:
         # Clear first: _maybe_upload's in-flight guard would otherwise see this
         # very task, which is still running, and refuse to re-kick.
         self._task = None
-        if self.status == STATUS_PENDING:
-            if self._current() == (sending, gray4, rotation):
-                self._schedule_retry()  # failed; try again on the timer
-            else:
-                self._maybe_upload()  # edited mid-upload; send the new frame now
+        # Whether this failed or the text was edited mid-upload, the panel is
+        # asleep now -- it sleeps the moment it has rendered -- so both want the
+        # same thing: the next attempt aimed at the next wake.
+        self._maybe_upload()
 
     @callback
     def _current(self) -> tuple[str, bool, int]:

@@ -55,6 +55,22 @@ const cases = {
     assert.equal(nextValue("", "# Shopping", "mine", true), "mine");
   },
 
+  "an offline panel says so, and an online one does not": () => {
+    // "asleep, back in a minute" and "gone" look identical otherwise: the
+    // status line sits at `pending` either way.
+    const card = new ESPaperCard();
+    card._status = { classList: { toggle() {} } };
+    card._button = {};
+
+    card._state = { state: "on", attributes: { online: false, upload_status: "pending" } };
+    card._paint();
+    assert.match(card._status.textContent, /panel offline/);
+
+    card._state = { state: "on", attributes: { online: true, upload_status: "pending" } };
+    card._paint();
+    assert.doesNotMatch(card._status.textContent, /offline/);
+  },
+
   "Send with nothing changed sends nothing": () => {
     assert.deepEqual(sendPlan("# Hello", "# Hello", 90, 90), []);
   },

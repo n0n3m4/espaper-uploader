@@ -261,6 +261,10 @@ export class ESPaperCard extends Base {
     else if (pending) notes.push("unsaved changes");
     if (this._external) notes.push("changed elsewhere");
 
+    // Offline is worth saying even alongside an error: it usually explains it,
+    // and it is the difference between "asleep, back in a minute" and "gone".
+    if (attrs.online === false) notes.push(`panel offline · last seen ${ago(attrs.last_seen)}`);
+
     const problem = this._error ?? attrs.last_error;
     if (problem) {
       notes.push(problem);

@@ -3,10 +3,11 @@
 A Home Assistant integration for the [BLE e-paper display](../README.md): an
 ESP32-H2 driving a 400×300 monochrome panel.
 
-You get a **text entity**, a **dashboard card** and a **switch**. Put Markdown in
-either box, and the integration renders it — antialiased, in the panel's four
-grey levels — and pushes it the next time the panel wakes up. Once the panel is showing the current text, nothing
-further happens — no polling, no reconnecting — until you change the text again.
+You get a **text entity**, a **dashboard card**, a **switch** and a
+**connectivity sensor**. Put Markdown in either box, and the integration renders
+it — antialiased, in the panel's four grey levels — and pushes it the next time
+the panel wakes up. Once the panel is showing the current text, nothing further
+happens — no polling, no reconnecting — until you change the text again.
 
 <p align="center">
   <img src="docs/preview.png" alt="The panel showing a rendered shopping list" width="436">
@@ -34,25 +35,32 @@ Set from an automation with `espaper.set_markdown`.
 ## Why it works this way
 
 The board advertises for about two seconds and then deep-sleeps for a minute, so
-an upload cannot be scheduled — it has to be caught. Every advertisement Home
-Assistant's Bluetooth stack sees is an opportunity, and the integration takes it
-only while it actually owes the panel a frame. An update therefore lands within
+an upload cannot be scheduled — it has to be caught, and only while the
+integration actually owes the panel a frame. An update therefore lands within
 about one sleep cycle (~60 s by default), and a failed transfer simply retries on
 the next wake.
 
-Catching it means watching for it. While a frame is owed the integration checks
-every two seconds how old the last sighting of the panel is, and connects only
-when it is fresher than five seconds — the width of the wake window. A stale
-sighting means the radio is already off, and connecting to it does not fail
-fast: it holds the adapter for the whole connect timeout, which is longer than
-the window that would have worked. No sighting at all counts as asleep too —
-Home Assistant forgets a device that has been quiet for a while, and a panel
-that is off or out of range must not be hammered.
+Catching it means being early, not quick. Reacting to an advertisement is
+already too late — by the time it has reached Home Assistant and been noticed, a
+good part of the two seconds is gone. But a connect attempt is not an instant
+thing: the request stays *pending* for about twenty seconds, and the Bluetooth
+controller latches onto the panel's first advertisement in hardware. So the
+integration works out when the panel is next due — from the interval Home
+Assistant has learned for it, falling back to 62 s — and opens that twenty-second
+net a few seconds *before* the wake it is aiming at. One attempt per cycle,
+covering the window from both sides.
 
-The check itself is free (it reads Home Assistant's advertisement history, not
-the radio), so it simply keeps going until the panel confirms the frame. An
-update queued against a panel that is switched off lands whenever it comes
-back, with no attempt limit and nothing to retrigger by hand.
+If the panel has not been heard from for five minutes it is treated as offline
+and attempts stop, leaving only the advertisement history being watched once a
+minute, which costs a dictionary lookup and no radio at all. That matters most
+with an ESPHome Bluetooth proxy: every attempt takes one of its few connection
+slots and pauses the scanning that everything else behind it depends on. The
+frame is still owed, and goes out on the first cycle after the panel returns —
+no attempt limit, nothing to retrigger by hand.
+
+A `binary_sensor` reports that online/offline state, and the text entity carries
+it as the `online` and `last_seen` attributes. Text can still be set while the
+panel is offline — that is exactly when queueing it matters.
 
 E-paper holds its image without power, so after a Home Assistant restart the
 integration compares the restored text with the text it last confirmed on the
@@ -356,9 +364,10 @@ Reading the state:
 
 | Symptom | Meaning |
 |---|---|
-| `last advertisement 34.2s ago, panel is asleep` | Normal — the board is reachable ~2 s per minute, so most checks land in the sleep. |
-| `last advertisement never, panel is asleep`, repeating | Home Assistant is not hearing the board at all: it is off, out of range, or the adapter is down. The upload stays queued and goes out when it returns. |
-| `upload failed: ...` then `retrying upload` | Also normal: the window was caught but the connection did not complete in it. |
+| `next attempt in 34s` | Normal — that is the aim, a few seconds ahead of the panel's next wake. |
+| `upload failed: ...` then `next attempt in 54s` | Also normal: the net was open but the panel did not turn up in it. Expect the odd one. |
+| `next attempt in 60s (panel offline)` | Nothing heard from the panel for five minutes: it is off, flat, out of range, or the adapter is down. The frame stays queued and goes out when it returns. |
+| `panel online` / `panel offline` | The connectivity sensor changing state. |
 | Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |
 | `no BLE device known yet, waiting` | Home Assistant has never seen the board. Check the adapter, and that the firmware is advertising. |
 | `state=ERROR err=CRC_MISMATCH` | The transfer corrupted. Retries automatically. |
@@ -366,7 +375,7 @@ Reading the state:
 | `state=ERROR err=BAD_LENGTH` after turning on 4 colours | The firmware predates 2bpp or deflate. Flash the current build, or turn the switch off. |
 | `panel advertises 1 bpp, sending black and white` | Older firmware; harmless, and the switch stays on for when it is updated. |
 | The card is missing from the picker | Open `/espaper/espaper-card.js` in a browser tab. A 404 means the integration never registered it — the log says `dashboard card served at ...` on a good start, and warns if `www/espaper-card.js` is missing from the install. If it serves fine, it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
-| Stuck at `pending` forever | Look for the `panel is asleep` lines. If they are absent, the retry timer is not arming — that is a bug, please report it. |
+| Stuck at `pending` forever | Look for the `next attempt in ...` lines. If they are absent, nothing is armed — that is a bug, please report it. |
 | Stuck at `uploading` forever | Should be impossible: every upload failure is caught and re-armed. If it happens, the log has a traceback — please report it. |
 
 The entity's `upload_status` attribute shows the same state without touching

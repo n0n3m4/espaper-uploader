@@ -17,7 +17,11 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from custom_components.espaper.coordinator import (  # noqa: E402
-    ADVERT_TTL,
+    CYCLE_FALLBACK,
+    LEAD,
+    MIN_DELAY,
+    OFFLINE_POLL,
+    ONLINE_TTL,
     STATUS_IDLE,
     STATUS_PENDING,
     EPaperCoordinator,
@@ -30,10 +34,15 @@ ADDRESS = "AA:BB:CC:DD:EE:FF"
 
 
 class _CapturedTimer:
-    """Stands in for the unsub that async_call_later returns."""
+    """Stands in for the unsub that async_call_later returns.
 
-    def __init__(self, callback):
+    Keeps the delay it was armed with, since when the next attempt is aimed is
+    now the whole point.
+    """
+
+    def __init__(self, callback, delay=None):
         self.callback = callback
+        self.delay = delay
 
     def __call__(self):  # cancelling the timer
         self.callback = lambda _now: None
@@ -80,12 +89,22 @@ def service_info(age: float = 0.0):
     return info
 
 
-def asleep(age: float = ADVERT_TTL + 25):
-    """Patch the advertisement history to say the panel went back to sleep."""
+def seen(age: float):
+    """Patch the advertisement history to a sighting `age` seconds old."""
     return patch(
         "custom_components.espaper.coordinator.bluetooth.async_last_service_info",
         return_value=service_info(age),
     )
+
+
+def armed_delay(coordinator) -> int:
+    """How long the armed attempt was given, to the nearest second.
+
+    The ages these tests set are real elapsed time, so the delays come out a
+    hair under the arithmetic; nothing here turns on a fraction of a second.
+    """
+    assert coordinator._retry_unsub is not None, "no attempt armed"
+    return round(coordinator._retry_unsub.delay)
 
 
 def fire_retry(coordinator) -> bool:
@@ -338,25 +357,73 @@ async def test_retries_without_any_advertisement():
     assert coordinator.status == STATUS_IDLE
 
 
-async def test_asleep_panel_is_never_connected_to():
-    """The board is reachable ~2 s a minute; a stale sighting means it is gone.
+async def test_attempt_is_aimed_before_the_next_wake():
+    """The panel is connectable ~2 s a minute, and noticing is always too late.
 
-    Connecting anyway does not fail fast -- it blocks the adapter for the whole
-    connect timeout, which is longer than the next wake window, so a doomed
-    attempt costs the very window that would have worked.
+    A connect attempt is a 20 s net -- the controller holds the request pending
+    and latches onto the first advertisement -- so it is opened LEAD seconds
+    before the panel is next due rather than fired when we hear about it.
     """
     coordinator, display = build()
-    with asleep():
+    with seen(20):
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
-    assert not display.pushes, "connected to a panel that is asleep"
+    assert not display.pushes, "connected in the middle of the panel's sleep"
     assert coordinator.status == STATUS_PENDING
-    assert coordinator._retry_unsub is not None, "no retry armed while asleep"
+    assert armed_delay(coordinator) == CYCLE_FALLBACK - 20 - LEAD
 
-    # A panel HA has not heard from at all is asleep too, not an invitation to
-    # try blind: it drops a quiet device from its advertisement history, so an
-    # unplugged panel lands here and would otherwise hold the adapter for a
-    # 20 s connect timeout every couple of seconds, forever.
+    # ...and when it fires, the frame goes out.
+    assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+    assert coordinator.status == STATUS_IDLE
+
+
+async def test_missed_wakes_stay_phase_locked():
+    # Two cycles with no sighting does not mean "try constantly": the panel
+    # keeps its own clock, so the phase still says when it is next due. Getting
+    # this wrong costs a connection slot on an ESPHome proxy every two seconds.
+    coordinator, display = build()
+    with seen(2 * CYCLE_FALLBACK + 6):
+        await coordinator.async_set_markdown("# Hello")
+        await settle(coordinator)
+    assert not display.pushes
+    assert armed_delay(coordinator) == CYCLE_FALLBACK - 6 - LEAD
+
+
+async def test_learned_cycle_beats_the_fallback():
+    # Home Assistant measures the advertising interval, and it is the panel's
+    # real duty cycle including clock drift -- better than any constant here.
+    coordinator, display = build()
+    with (
+        seen(5),
+        patch(
+            "custom_components.espaper.coordinator.bluetooth"
+            ".async_get_learned_advertising_interval",
+            return_value=30,
+        ),
+    ):
+        await coordinator.async_set_markdown("# Hello")
+        await settle(coordinator)
+    assert armed_delay(coordinator) == 30 - 5 - LEAD
+
+
+async def test_offline_panel_is_left_alone():
+    """Past ONLINE_TTL the panel is off, flat or out of range.
+
+    Attempts stop entirely: on a proxy each one takes a connection slot and
+    pauses the scanning every other device behind it depends on. Only the
+    advertisement history is watched, and that costs a dict lookup.
+    """
+    coordinator, display = build()
+    with seen(ONLINE_TTL + 60):
+        await coordinator.async_set_markdown("# Hello")
+        await settle(coordinator)
+    assert not display.pushes, "connected to a panel that is not there"
+    assert armed_delay(coordinator) == OFFLINE_POLL
+
+    # A panel HA has no sighting of at all is the same case: it drops a device
+    # from its history once it has been quiet long enough.
     with patch(
         "custom_components.espaper.coordinator.bluetooth.async_last_service_info",
         return_value=None,
@@ -364,10 +431,51 @@ async def test_asleep_panel_is_never_connected_to():
         assert fire_retry(coordinator)
         await settle(coordinator)
     assert not display.pushes, "connected to a panel HA has never seen"
-    assert coordinator._retry_unsub is not None
+    assert armed_delay(coordinator) == OFFLINE_POLL
 
-    # ...and the moment it wakes, the frame goes out.
+    # ...and the frame is still owed when it comes back.
     assert fire_retry(coordinator)
+    await settle(coordinator)
+    assert len(display.pushes) == 1
+
+
+async def test_online_flag_ages_out_on_the_tick():
+    # Going offline is the passage of time, not an event, and HA suppresses
+    # this board's repeat advertisements -- so only the tick can notice.
+    coordinator, _ = build()
+    updates = []
+    coordinator.async_add_listener(lambda: updates.append(coordinator.online))
+
+    coordinator._async_tick(None)
+    assert coordinator.online is True
+    assert coordinator.last_seen is not None
+    assert updates == [True], "entities were not told the panel appeared"
+
+    with seen(ONLINE_TTL + 1):
+        coordinator._async_tick(None)
+    assert coordinator.online is False
+    assert updates == [True, False]
+
+    # Steady state notifies nobody: entity writes are not free.
+    coordinator._async_tick(None)
+    coordinator._async_tick(None)
+    assert updates == [True, False, True]
+
+
+async def test_failure_does_not_spin():
+    # A push that fails instantly, against a sighting fresh enough to mean
+    # "awake now", would otherwise re-kick itself as fast as the event loop
+    # allows until the sighting aged out.
+    coordinator, display = build()
+    display.fail = True
+    await coordinator.async_set_markdown("# Hello")
+    await settle(coordinator)
+    assert armed_delay(coordinator) == MIN_DELAY, "no cool-off after a failure"
+
+    # ...but an advertisement is proof the panel is up this instant, and a spin
+    # does not advertise, so that outranks the cool-off.
+    display.fail = False
+    advertise(coordinator)
     await settle(coordinator)
     assert len(display.pushes) == 1
 
@@ -432,7 +540,7 @@ if __name__ == "__main__":
     with (
         patch(
             "custom_components.espaper.coordinator.async_call_later",
-            new=lambda hass, delay, action: _CapturedTimer(action),
+            new=lambda hass, delay, action: _CapturedTimer(action, delay),
         ),
         patch(
             "custom_components.espaper.coordinator.bluetooth"
