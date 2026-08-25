@@ -29,8 +29,9 @@ SAMPLE = """# Shopping
 
 Milk, **eggs**, and a *very* long line that has to wrap somewhere sensible.
 
-- bread
-- 500 g of `flour`
+- [x] bread
+- [ ] 500 g of `flour`
+  - the ~~cheap~~ ***good*** kind
 1. first
 2. second
 
@@ -124,6 +125,39 @@ def test_markup_is_not_literal():
     assert render_markdown("**bold**", SIZE) != plain  # bolder, so different
     # ...but a heading marker is consumed, not drawn:
     assert render_markdown("# Hi", SIZE) != render_markdown("\\# Hi", SIZE)
+
+
+def test_inline_extensions():
+    def ink(source):
+        return sum(1 for v in render_image(source, SIZE).convert("L").tobytes() if v == 0)
+
+    # A strike rule is ink the plain word does not have, and neither render may
+    # be the one with the tildes still in it.
+    assert ink("~~x~~") > ink("x")
+    assert render_markdown("~~x~~", SIZE) != render_markdown("x", SIZE)
+    assert render_markdown("~~x~~", SIZE) != render_markdown("\\~\\~x", SIZE)
+    # Emphasis folds into bold, so three markers are just bold -- and, in
+    # particular, leave no stray asterisk behind.
+    assert render_markdown("***x***", SIZE) == render_markdown("**x**", SIZE)
+    assert render_markdown("___x___", SIZE) == render_markdown("**x**", SIZE)
+    # Strike survives emphasis inside it: bolder than the struck plain word.
+    assert ink("~~**x**~~") > ink("~~x~~")
+
+
+def test_list_extensions():
+    # Bullet, empty box and ticked box are three different markers.
+    frames = {
+        render_markdown(source, SIZE)
+        for source in ("- a", "- [ ] a", "- [x] a")
+    }
+    assert len(frames) == 3
+    # ...and the marker is consumed, not drawn as literal brackets.
+    assert render_markdown("- [ ] a", SIZE) != render_markdown("- \\[ \\] a", SIZE)
+    # Nesting steps in, and stops stepping before it runs out of panel.
+    assert render_markdown("- a\n  - b", SIZE) != render_markdown("- a\n- b", SIZE)
+    assert render_markdown("- " + "x" * 40, SIZE)
+    deep = "      - x"  # depth 3, the cap
+    assert render_markdown(deep, SIZE) == render_markdown("        - x", SIZE)
 
 
 def test_nothing_runs_off_the_edge():

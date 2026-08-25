@@ -32,11 +32,12 @@ Everything here is tuned for a small panel rather than a screen:
 
 from __future__ import annotations
 
+import math
 import re
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 FONT_DIR = Path(__file__).parent / "fonts"
 FONT_REGULAR = FONT_DIR / "NotoSans-SemiCondensedMedium.ttf"
@@ -72,15 +73,32 @@ HEADING_LEAD = 7
 # pitch is built from the ink band instead (see _metrics).
 LINE_SPACING = 0.3
 PARAGRAPH_GAP = 5
-INDENT = 14
+# Hanging indent for a list item or a quote, and the column the marker sits
+# in. Wide enough for the drawn checkbox (see _draw_checkbox) plus a gap.
+INDENT = 18
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
-_BULLET = re.compile(r"^\s*[-*+]\s+(.*)$")
-_ORDERED = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
+_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_ORDERED = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
+_TASK = re.compile(r"^\[([ xX])\]\s+(.*)$")
 _RULE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 _QUOTE = re.compile(r"^\s*>\s?(.*)$")
-# Inline runs: **bold**, *italic*/_italic_, `code`. Ordered so ** wins over *.
-_INLINE = re.compile(r"(\*\*.+?\*\*|__.+?__|\*.+?\*|_.+?_|`.+?`)", re.DOTALL)
+# Inline runs: ***both***, **bold**, *italic*/_italic_, ~~strike~~, `code`.
+# Ordered longest marker first, so *** wins over ** wins over *.
+_INLINE = re.compile(
+    r"(\*\*\*.+?\*\*\*|___.+?___|\*\*.+?\*\*|__.+?__"
+    r"|\*.+?\*|_.+?_|~~.+?~~|`.+?`)",
+    re.DOTALL,
+)
+# How deep a nested list may step before the indent eats the whole panel.
+MAX_DEPTH = 3
+# Task-list tick: how far the X is held off the inside of the box, and how wide
+# its two strokes are. Both in pixels at body size. The panel's four levels
+# quantise the weight hard -- sweeping 1.1 to 2.1 gives exactly three distinct
+# marks (a light feather, a dark one, and a solid double-width core at ~2.05),
+# so there is nothing to tune between these numbers.
+X_INSET = 2.5
+X_WEIGHT = 1.25
 
 
 @lru_cache(maxsize=32)
@@ -103,25 +121,46 @@ def _metrics(size: float) -> tuple[int, int, int]:
     return (bottom - top) + max(3, round(size * LINE_SPACING)), top, bottom
 
 
-def _split_inline(text: str) -> list[tuple[str, bool, bool]]:
-    """Split a line into ``(text, bold, code)`` runs, markers stripped.
+@lru_cache(maxsize=32)
+def _strike_offset(bold: bool, size: float) -> float:
+    """Return the y offset of the strike rule, relative to ``draw.text``.
+
+    The middle of the x-height band, which is what ``getbbox("x")`` gives
+    directly -- the "Ag" band of :func:`_metrics` runs from the cap line to
+    the descender, and its middle sits too low to read as a strike. Doubles
+    as the centre line for a task-list checkbox.
+    """
+    _, top, _, bottom = _font(bold, size).getbbox("x")
+    return (top + bottom) / 2
+
+
+def _split_inline(text: str) -> list[tuple[str, bool, bool, bool]]:
+    """Split a line into ``(text, bold, code, strike)`` runs, markers stripped.
 
     Italic is folded into bold: there is no italic cut of the bundled face,
     and a synthetic skew smears into mush once thresholded. Emphasis of
-    either kind therefore renders as SemiBold.
+    either kind therefore renders as SemiBold, which also makes
+    ``***both***`` simply bold.
+
+    ``~~struck~~`` recurses, so the emphasis inside a struck span survives;
+    the alternation itself does not nest, so nothing else does.
     """
-    runs: list[tuple[str, bool, bool]] = []
+    runs: list[tuple[str, bool, bool, bool]] = []
     for part in _INLINE.split(text):
         if not part:
             continue
         if part.startswith("`") and part.endswith("`") and len(part) > 1:
-            runs.append((part[1:-1], False, True))
+            runs.append((part[1:-1], False, True, False))
+        elif part[:2] == "~~" and len(part) > 4:
+            runs += [(t, b, c, True) for t, b, c, _ in _split_inline(part[2:-2])]
+        elif part[:3] in ("***", "___") and len(part) > 6:
+            runs.append((part[3:-3], True, False, False))
         elif part[:2] in ("**", "__") and len(part) > 4:
-            runs.append((part[2:-2], True, False))
+            runs.append((part[2:-2], True, False, False))
         elif part[0] in "*_" and len(part) > 2:
-            runs.append((part[1:-1], True, False))
+            runs.append((part[1:-1], True, False, False))
         else:
-            runs.append((part, False, False))
+            runs.append((part, False, False, False))
     return runs
 
 
@@ -132,9 +171,9 @@ def _wrap(runs, size, max_width):
     does not force a break. Words wider than the whole line are hard-split so
     a pasted URL cannot run off the panel.
     """
-    lines: list[list[tuple[str, bool, bool]]] = [[]]
+    lines: list[list[tuple[str, bool, bool, bool]]] = [[]]
     width = 0.0
-    for text, bold, code in runs:
+    for text, bold, code, strike in runs:
         font = _font(bold, size)
         # Keep the spaces as their own tokens so run boundaries survive.
         for token in re.split(r"(\s+)", text):
@@ -143,7 +182,7 @@ def _wrap(runs, size, max_width):
             token_width = font.getlength(token)
             if token.isspace():
                 if lines[-1]:  # never start a line with a space
-                    lines[-1].append((" ", bold, code))
+                    lines[-1].append((" ", bold, code, strike))
                     width += font.getlength(" ")
                 continue
             if width and width + token_width > max_width:
@@ -156,20 +195,70 @@ def _wrap(runs, size, max_width):
                 cut = len(token)
                 while cut > 1 and font.getlength(token[:cut]) > max_width:
                     cut -= 1
-                lines[-1].append((token[:cut], bold, code))
+                lines[-1].append((token[:cut], bold, code, strike))
                 lines.append([])
                 token = token[cut:]
                 token_width = font.getlength(token)
             if token:
-                lines[-1].append((token, bold, code))
+                lines[-1].append((token, bold, code, strike))
                 width += token_width
     return [line for line in lines if line]
 
 
-def _draw_line(draw, x, y, line, size) -> int:
+def _stamp(canvas, box, ink, code=False) -> None:
+    """Composite ``ink`` -- itself a greyscale image -- into ``box`` by min().
+
+    Not alpha-over. Where an antialiased edge of the mark lands on an
+    antialiased edge of a glyph, compositing multiplies the two coverages and
+    the join comes out darker than either side of it: a visible knot at every
+    crossing. Taking the darker of the two instead leaves the glyph exactly as
+    dark as it was and the mark exactly as dark as it was, which is what the
+    eye expects of one stroke laid over another. White ink inside a code box
+    is the same rule with max().
+    """
+    x0, y0, x1, y1 = box
+    clipped = (
+        max(x0, 0), max(y0, 0), min(x1, canvas.width), min(y1, canvas.height)
+    )
+    if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+        return
+    if clipped != box:
+        # Cropping past the edge would pad with black and paste it back in.
+        ink = ink.crop((c - o for c, o in zip(clipped, (x0, y0, x0, y0))))
+    op = ImageChops.lighter if code else ImageChops.darker
+    canvas.paste(op(canvas.crop(clipped), ink), clipped)
+
+
+def _strike_rule(canvas, x0, length, centre, size, code) -> None:
+    """Draw one antialiased strike rule.
+
+    ``draw.line`` does not antialias, so it can only put the rule on a whole
+    pixel row and only at full strength -- next to the greys of the text it
+    crosses, that reads as a hard bar. Here the rule sits at its true
+    fractional height and each row is inked by how much of it that row covers.
+    """
+    # A tenth of the size, ~1.6 px at body size: enough to leave a genuinely
+    # grey row on each side of a solid one. Thinner and the edges round away to
+    # nothing on the panel's four levels; at 2 px it is a black bar.
+    thickness = size / 10
+    top = centre - thickness / 2
+    first, last = math.floor(top), math.ceil(top + thickness)
+    width = max(1, round(length))
+    rule = Image.new("L", (width, last - first))
+    for row in range(first, last):
+        cover = max(0.0, min(row + 1, top + thickness) - max(row, top))
+        rule.paste(
+            round(255 * (cover if code else 1 - cover)),
+            (0, row - first, width, row - first + 1),
+        )
+    x0 = round(x0)
+    _stamp(canvas, (x0, first, x0 + width, last), rule, code)
+
+
+def _draw_line(canvas, draw, x, y, line, size) -> int:
     """Draw one wrapped line at ``(x, y)``; return its height."""
     height = 0
-    for text, bold, code in line:
+    for text, bold, code, strike in line:
         font = _font(bold, size)
         length = font.getlength(text)
         if code:
@@ -179,9 +268,77 @@ def _draw_line(draw, x, y, line, size) -> int:
             draw.text((x, y), text, font=font, fill=255)
         else:
             draw.text((x, y), text, font=font, fill=0)
+        if strike:
+            # Runs abut, so a span split across several of them still reads as
+            # one rule.
+            _strike_rule(canvas, x, length, y + _strike_offset(bold, size), size, code)
         x += length
         height = max(height, size)
     return height
+
+
+def _draw_checkbox(canvas, draw, x, y, size, checked) -> None:
+    """Draw a task-list checkbox at ``(x, y)``, sized to sit on the text.
+
+    Drawn rather than written: the bundled face has no U+2610/U+2611/U+2713,
+    and all three come back as the .notdef box. The square is centred on the
+    x-height so it sits with the text, and is narrow enough to live inside
+    :data:`INDENT`.
+    """
+    side = round(size * 0.72)
+    top = round(y + _strike_offset(False, size)) - side // 2
+    # The box is axis-aligned on whole pixels, so it needs no help.
+    draw.rectangle((x, top, x + side, top + side), outline=0)
+    if not checked:
+        return
+    # An X, not a tick: at ~12 px a checkmark's short arm merges into its long
+    # one and the whole thing reads as a slash.
+    span = side + 1
+    _stamp(canvas, (x, top, x + span, top + span), _x_mark(span))
+
+
+@lru_cache(maxsize=8)
+def _x_mark(span: int) -> Image.Image:
+    """Return an antialiased X as a ``span``x``span`` greyscale image.
+
+    Coverage is computed per pixel the way :func:`_strike_rule` computes it per
+    row, rather than by drawing at a multiple and filtering down: box-filtering
+    a supersampled diagonal lands unequal amounts of ink in neighbouring pixels
+    and the result reads as a checkerboard, not a stroke.
+
+    Each pixel centre is put into the diagonals' own frame -- ``u`` along one
+    arm, ``v`` along the other -- where the distance across a stroke and the
+    distance along it are just ``|v|`` and ``|u|``. The two arms combine with
+    ``max``, so the crossing is exactly as dark as a stroke and no darker.
+    Both the pixel centres and the arms are symmetric about the middle of the
+    box, so the result is identical under every flip and transpose of itself.
+    """
+    mark = Image.new("L", (span, span), 255)
+    pixels = mark.load()
+    centre = span / 2
+    across = X_WEIGHT / 2
+    along = (span - 2 * X_INSET) / 2 * math.sqrt(2)
+
+    def bar(distance, extent):
+        # One pixel of feathering at the edge, which is what an exactly
+        # half-covered pixel comes out as.
+        return min(max(extent + 0.5 - abs(distance), 0.0), 1.0)
+
+    for iy in range(span):
+        for ix in range(span):
+            dx, dy = ix + 0.5 - centre, iy + 0.5 - centre
+            u, v = (dx + dy) / math.sqrt(2), (dx - dy) / math.sqrt(2)
+            cover = max(
+                bar(v, across) * bar(u, along),
+                bar(u, across) * bar(v, along),
+            )
+            pixels[ix, iy] = round(255 * (1 - cover))
+    return mark
+
+
+def _depth(spaces: str) -> int:
+    """Nesting level of a list item from its leading whitespace."""
+    return min(len(spaces.expandtabs(2)) // 2, MAX_DEPTH)
 
 
 def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
@@ -205,6 +362,7 @@ def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
         bold_all = False
         heading_level = 0
         quoted = False
+        checked = None
 
         if not line.strip():
             y += PARAGRAPH_GAP
@@ -229,25 +387,33 @@ def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
             quoted = True
             line = match.group(1)
         elif match := _BULLET.match(line):
-            prefix = "• "
-            indent = INDENT
-            line = match.group(1)
-        elif match := _ORDERED.match(line):
-            prefix = f"{match.group(1)}. "
-            indent = INDENT
+            indent = INDENT * (_depth(match.group(1)) + 1)
             line = match.group(2)
+            if task := _TASK.match(line):
+                # Drawn, not typed: the bundled face has no checkbox glyph.
+                checked = task.group(1) != " "
+                line = task.group(2)
+            else:
+                prefix = "• "
+        elif match := _ORDERED.match(line):
+            prefix = f"{match.group(2)}. "
+            indent = INDENT * (_depth(match.group(1)) + 1)
+            line = match.group(3)
 
         runs = _split_inline(line)
         if bold_all:
-            runs = [(t, True, c) for t, _, c in runs]
+            runs = [(t, True, c, s) for t, _, c, s in runs]
 
         x0 = MARGIN + indent
+        # The marker sits in the indent, so wrapped lines hang under the text
+        # rather than under the bullet.
+        marker_x = x0 - INDENT
         if prefix:
-            # The marker sits in the indent, so wrapped lines hang under the
-            # text rather than under the bullet.
             draw.text(
-                (MARGIN, y), prefix, font=_font(bold_all, font_size), fill=0
+                (marker_x, y), prefix, font=_font(bold_all, font_size), fill=0
             )
+        elif checked is not None:
+            _draw_checkbox(canvas, draw, marker_x, y, font_size, checked)
 
         pitch, ink_top, ink_bottom = _metrics(font_size)
         quote_top = y + ink_top
@@ -255,7 +421,7 @@ def render_canvas(text: str, size: tuple[int, int] = (400, 300)) -> Image.Image:
             if y + ink_bottom > bottom:
                 clipped = True
                 break
-            _draw_line(draw, x0, y, wrapped, font_size)
+            _draw_line(canvas, draw, x0, y, wrapped, font_size)
             y += pitch
         if quoted and y > quote_top:
             # One bar for the whole quote, not a tick per line.

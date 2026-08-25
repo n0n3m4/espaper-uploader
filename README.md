@@ -20,16 +20,13 @@ That panel is [this Markdown](docs/sample.md):
 
 Pick up on the way home from **Netto**, before 8pm.
 
-- Milk, 2 L
-- 500 g of `flour`
-- A really long item name that has to wrap onto the next line neatly
-1. Bread
-2. Eggs
+- [x] Milk, 2 L
+- [ ] 500 g of `flour`
+- [ ] A really long item name that has to wrap onto the next line neatly
+- [x] ~~Bread~~ got it yesterday
 
 ## Notes
 > The panel refreshes about once a minute, and holds the image with no power.
-
-Set from an automation with `espaper.set_markdown`.
 ```
 
 ## Why it works this way
@@ -273,21 +270,37 @@ A deliberate subset, chosen for what stays legible on a 400×300 panel:
 
 | Syntax | Rendered as |
 |---|---|
-| `# ## ###` | Headings, 26/22/18 px semibold; `#` and `##` get a rule under them |
+| `# ## ###` | Headings, 29.75/26/21 px semibold; `#` and `##` get a rule under them |
 | `- item` / `* item` | Bullet, hanging indent |
 | `1. item` | Numbered, hanging indent |
-| `**bold**`, `*italic*` | Semibold (see below) |
+| `- [ ]` / `- [x]` | Task item: an empty box, or one with an X in it |
+| two spaces of indent | One level of nesting, up to three |
+| `**bold**`, `*italic*`, `***both***` | Semibold (see below) |
+| `~~struck~~` | Struck through, antialiased |
 | `` `code` `` | White-on-black box |
 | `> quote` | Indented, with a bar down the whole quote |
 | `---` | Horizontal rule |
 | blank line | Paragraph gap |
+
+Links and fenced code blocks are *not* in the subset: `[label](url)` and
+```` ``` ```` reach the panel as themselves. A URL is unreadable at this size
+anyway, so write the label alone.
 
 Text that runs past the bottom of the panel is clipped, and a `…` is drawn in the
 corner so it is obvious something was cut.
 
 There is no italic cut of the bundled font, and a synthetic skew turns to mush
 at this size, so `*italic*` renders as semibold — emphasis is shown, just not
-distinguished from `**bold**`.
+distinguished from `**bold**`, which also makes `***both***` simply bold.
+
+The task-list box is *drawn*, not written: the bundled face has no `☐`, `☑` or
+`✓` — all three come back as the .notdef box. Its X is supersampled and filtered
+down, and so is the strike rule, because a bare `draw.line` puts a hard-edged
+staircase next to text that is antialiased. Both are composited by taking the
+darker of the two pixels rather than by alpha-over: where the antialiased edge
+of a mark crosses the antialiased edge of a glyph, blending multiplies the two
+coverages and knots the join, while `min()` leaves each exactly as dark as it
+already was.
 
 ## Rendering notes
 
