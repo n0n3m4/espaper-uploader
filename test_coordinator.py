@@ -17,8 +17,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from custom_components.espaper.coordinator import (  # noqa: E402
-    CYCLE_FALLBACK,
-    LEAD,
+    BURST,
     MIN_DELAY,
     OFFLINE_POLL,
     ONLINE_TTL,
@@ -357,12 +356,13 @@ async def test_retries_without_any_advertisement():
     assert coordinator.status == STATUS_IDLE
 
 
-async def test_attempt_is_aimed_before_the_next_wake():
-    """The panel is connectable ~2 s a minute, and noticing is always too late.
+async def test_keeps_the_net_open_while_online():
+    """No prediction: while a frame is owed, just keep re-arming the net.
 
     A connect attempt is a 20 s net -- the controller holds the request pending
-    and latches onto the first advertisement -- so it is opened LEAD seconds
-    before the panel is next due rather than fired when we hear about it.
+    and latches onto the panel's first advertisement -- so back-to-back
+    attempts leave nowhere for the panel to wake up unnoticed. Aiming one net
+    at a predicted wake was fragile: every miss cost a whole cycle.
     """
     coordinator, display = build()
     with seen(20):
@@ -370,7 +370,7 @@ async def test_attempt_is_aimed_before_the_next_wake():
         await settle(coordinator)
     assert not display.pushes, "connected in the middle of the panel's sleep"
     assert coordinator.status == STATUS_PENDING
-    assert armed_delay(coordinator) == CYCLE_FALLBACK - 20 - LEAD
+    assert armed_delay(coordinator) == MIN_DELAY
 
     # ...and when it fires, the frame goes out.
     assert fire_retry(coordinator)
@@ -379,33 +379,47 @@ async def test_attempt_is_aimed_before_the_next_wake():
     assert coordinator.status == STATUS_IDLE
 
 
-async def test_missed_wakes_stay_phase_locked():
-    # Two cycles with no sighting does not mean "try constantly": the panel
-    # keeps its own clock, so the phase still says when it is next due. Getting
-    # this wrong costs a connection slot on an ESPHome proxy every two seconds.
+async def test_burst_expires_into_a_quiet_gap():
+    """The burst is bounded, because our own connecting blinds the scanner.
+
+    On an ESPHome proxy a pending connect takes a connection slot and stops the
+    scanning -- including the advertisements that are the only evidence the
+    panel is still there. So the nets stop after BURST and the radio is left
+    alone for a while.
+    """
     coordinator, display = build()
-    with seen(2 * CYCLE_FALLBACK + 6):
+    with seen(20):
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
-    assert not display.pushes
-    assert armed_delay(coordinator) == CYCLE_FALLBACK - 6 - LEAD
+        assert armed_delay(coordinator) == MIN_DELAY
+
+        coordinator._burst_until = time.monotonic() - 1
+        assert fire_retry(coordinator)
+        await settle(coordinator)
+    assert not display.pushes, "kept hammering past the end of the burst"
+    assert armed_delay(coordinator) == OFFLINE_POLL
 
 
-async def test_learned_cycle_beats_the_fallback():
-    # Home Assistant measures the advertising interval, and it is the panel's
-    # real duty cycle including clock drift -- better than any constant here.
+async def test_a_fresh_sighting_rearms_the_burst():
+    """A panel that is still cycling is worth another burst.
+
+    Not driven by the advertisement callback: HA suppresses this board's repeat
+    advertisements, so the tick reading the history is what has to notice.
+    """
     coordinator, display = build()
-    with (
-        seen(5),
-        patch(
-            "custom_components.espaper.coordinator.bluetooth"
-            ".async_get_learned_advertising_interval",
-            return_value=30,
-        ),
-    ):
+    with seen(20):
         await coordinator.async_set_markdown("# Hello")
         await settle(coordinator)
-    assert armed_delay(coordinator) == 30 - 5 - LEAD
+        coordinator._burst_until = time.monotonic() - 1
+        assert fire_retry(coordinator)
+        await settle(coordinator)
+        assert armed_delay(coordinator) == OFFLINE_POLL
+
+    # The quiet gap lets the proxy scan again, and it hears the panel.
+    with seen(10):
+        coordinator._async_tick(None)
+    assert armed_delay(coordinator) == MIN_DELAY, "a live panel was left queued"
+    assert coordinator._burst_until - time.monotonic() > BURST - 5
 
 
 async def test_offline_panel_is_left_alone():

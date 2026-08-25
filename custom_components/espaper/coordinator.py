@@ -1,15 +1,19 @@
 """Renders Markdown and pushes it the next time the panel wakes.
 
 The board advertises for ~2 s and then deep-sleeps ~60 s, so an upload cannot
-be scheduled against the panel -- but it can be aimed. A connect attempt is a
-20 s net rather than an instant: the controller holds the request pending and
-latches onto the peer's first advertisement in hardware. So the coordinator
-opens that net a few seconds before the panel is next due, instead of reacting
-to an advertisement it has already been told about a second or two too late.
+be scheduled against the panel -- but it does not have to be. A connect attempt
+is a 20 s net rather than an instant: the controller holds the request pending
+and latches onto the peer's first advertisement in hardware. So the coordinator
+simply keeps a net open, re-arming as each one expires, until the panel walks
+into it. No prediction of the next wake: the phase of the last sighting, the
+learned advertising interval and the panel's own clock all drift, and every
+mis-aimed net used to cost a whole cycle.
 
 It does that only while an upload is outstanding, and only while the panel is
 online -- a connection attempt is not free on an ESPHome Bluetooth proxy, which
-has a handful of connection slots and stops scanning while it opens one.
+has a handful of connection slots and stops scanning while it opens one. Which
+is also why the nets run in a bounded BURST with a quiet gap after it: our own
+connecting blinds the scanner that tells us the panel is still there.
 """
 
 from __future__ import annotations
@@ -54,19 +58,19 @@ STATUS_IDLE = "idle"
 STATUS_PENDING = "pending"
 STATUS_UPLOADING = "uploading"
 
-# Aiming the next attempt. The panel keeps a fixed duty cycle, so the last
-# sighting says when the next one is due; the attempt opens LEAD seconds before
-# that, and bleak's own 20 s connect timeout keeps it open well past it. LEAD is
-# the knob: the net covers a wake from LEAD seconds early to 20 - LEAD seconds
-# late, which is what absorbs the panel's clock drift, its render time, and a
-# proxy's batching of advertisements.
-CYCLE_FALLBACK = 62  # 2 s advertising + 60 s sleep, until HA has learned it
-LEAD = 8
+# How long to keep re-arming the net once a frame is owed. Each attempt is
+# bleak's own 20 s connect timeout, so this covers about two and a half of the
+# panel's ~62 s wake cycles -- far more than enough to catch a panel that is
+# really there. BURST is the knob.
+# ponytail: a panel that advertises but never accepts a connection re-arms this
+# every cycle, holding ~70% duty on the proxy while a frame is owed. Back the
+# burst off after N consecutive failed bursts if that ever shows up.
+BURST = 150
 # A sighting this fresh means the panel is probably awake this second, so there
 # is nothing to wait for.
 INSIDE_WINDOW = 3
 # ...but never two attempts closer together than this, or a push that fails
-# instantly spins.
+# instantly spins. Doubles as the gap between the nets of a burst.
 MIN_DELAY = 2
 
 # Five missed wake cycles. Past this the panel is off, flat or out of range, and
@@ -104,6 +108,10 @@ class EPaperCoordinator:
         self.last_seen: datetime | None = None
 
         self._cooling_off = False
+        # Deadline for the current burst of attempts, and the monotonic stamp of
+        # the sighting that last armed one.
+        self._burst_until: float | None = None
+        self._sighting: float | None = None
         self._device: BLEDevice | None = None
         self._task: asyncio.Task | None = None
         self._retry_unsub: Callable[[], None] | None = None
@@ -195,12 +203,11 @@ class EPaperCoordinator:
         self.uploaded_rotation = (
             rotation if uploaded_rotation is None else uploaded_rotation
         )
-        self.status = (
-            STATUS_IDLE
-            if (markdown, self.rotation) == (uploaded, self.uploaded_rotation)
-            else STATUS_PENDING
-        )
-        self._maybe_upload()
+        if (markdown, self.rotation) == (uploaded, self.uploaded_rotation):
+            self.status = STATUS_IDLE
+            self._maybe_upload()
+        else:
+            self._queue()
 
     @callback
     def async_restore_gray4(self, gray4: bool) -> None:
@@ -218,10 +225,7 @@ class EPaperCoordinator:
             return
         _LOGGER.debug("espaper %s: new markdown set, queueing upload", self.address)
         self.markdown = text
-        self.status = STATUS_PENDING
-        self.last_error = None
-        self._notify()
-        self._maybe_upload()
+        self._queue()
 
     async def async_set_rotation(self, rotation: int) -> None:
         """Turn the layout on the panel, and repaint."""
@@ -229,10 +233,7 @@ class EPaperCoordinator:
             return
         _LOGGER.debug("espaper %s: rotation %d, queueing upload", self.address, rotation)
         self.rotation = rotation
-        self.status = STATUS_PENDING
-        self.last_error = None
-        self._notify()
-        self._maybe_upload()
+        self._queue()
 
     async def async_set_gray4(self, gray4: bool) -> None:
         """Switch between 4 grey levels and black and white, and repaint."""
@@ -244,12 +245,18 @@ class EPaperCoordinator:
             4 if gray4 else 2,
         )
         self.gray4 = gray4
-        self.status = STATUS_PENDING
-        self.last_error = None
-        self._notify()
-        self._maybe_upload()
+        self._queue()
 
     # --------------------------------------------------------------- upload
+
+    @callback
+    def _queue(self) -> None:
+        """A frame is now owed: open a burst of attempts and start trying."""
+        self.status = STATUS_PENDING
+        self.last_error = None
+        self._burst_until = time.monotonic() + BURST
+        self._notify()
+        self._maybe_upload()
 
     @callback
     def _async_on_advertisement(
@@ -298,6 +305,16 @@ class EPaperCoordinator:
         age = self._last_seen()
         if age is not None:
             self.last_seen = dt_util.utcnow() - timedelta(seconds=age)
+            # A sighting later than the one that armed the last burst means the
+            # panel is still cycling, so it is worth holding the net open again.
+            # Deliberately not driven by the advertisement callback: HA
+            # suppresses this board's repeat advertisements, but the history
+            # this reads keeps moving, and the tick keeps reading it.
+            stamp = time.monotonic() - age
+            if self._sighting is None or stamp > self._sighting + 1:
+                self._sighting = stamp
+                if self.status == STATUS_PENDING:
+                    self._burst_until = time.monotonic() + BURST
         online = age is not None and age <= ONLINE_TTL
         if online == self.online:
             return
@@ -309,16 +326,17 @@ class EPaperCoordinator:
 
     @callback
     def _next_attempt_delay(self) -> float | None:
-        """Seconds to wait before the attempt most likely to catch the panel.
+        """Seconds to wait before the next attempt, or ``None`` for "don't".
 
         ``None`` while the panel is offline: there is nothing worth connecting
         to, and on a proxy an attempt costs a connection slot and a pause in
-        scanning that every other device behind it pays for.
+        scanning that every other device behind it pays for. And ``None`` again
+        once a burst is spent -- the same cost, plus the fact that a proxy which
+        never scans can never tell us the panel has gone.
 
-        Otherwise the panel is assumed to be keeping its duty cycle, so the next
-        wake is one cycle on from the last sighting -- or several, if sightings
-        have been missed, which is why this works off the phase rather than the
-        raw age. The attempt opens LEAD seconds ahead of it.
+        In between it is just MIN_DELAY, over and over: each attempt is a 20 s
+        net, so back-to-back attempts leave the panel nowhere to wake up
+        unnoticed.
         """
         age = self._last_seen()
         if age is None or age > ONLINE_TTL:
@@ -329,11 +347,9 @@ class EPaperCoordinator:
             # instantly would otherwise re-kick itself as fast as the event loop
             # allows until the sighting aged out.
             return MIN_DELAY if self._cooling_off else 0.0
-        cycle = (
-            bluetooth.async_get_learned_advertising_interval(self.hass, self.address)
-            or CYCLE_FALLBACK
-        )
-        return max(MIN_DELAY, cycle - (age % cycle) - LEAD)
+        if self._burst_until is None or time.monotonic() >= self._burst_until:
+            return None
+        return MIN_DELAY
 
     @callback
     def _maybe_upload(self) -> None:
@@ -358,7 +374,7 @@ class EPaperCoordinator:
 
     @callback
     def _schedule_retry(self) -> None:
-        """Arm the next attempt, aimed at the panel's next predicted wake."""
+        """Arm the next attempt, or the next look at a panel not worth trying."""
         self._cancel_retry()
 
         @callback
@@ -369,22 +385,26 @@ class EPaperCoordinator:
             self._maybe_upload()
 
         delay = self._next_attempt_delay()
-        _LOGGER.debug(
-            "espaper %s: next attempt in %.0fs%s",
-            self.address,
-            OFFLINE_POLL if delay is None else delay,
-            " (panel offline)" if delay is None else "",
-        )
         if delay is None:
+            why = " (panel offline)" if not self.online else " (holding off)"
             delay = OFFLINE_POLL
+        else:
+            why = ""
+        _LOGGER.debug(
+            "espaper %s: next attempt in %.0fs%s", self.address, delay, why
+        )
         self._retry_unsub = async_call_later(self.hass, delay, _retry)
 
     @callback
     def _async_tick(self, _now) -> None:
-        """Age the online flag out, and un-wedge a frame with nothing armed."""
+        """Age the online flag out, and re-decide what a frame still owed wants.
+
+        Unconditional, because _refresh_online may just have re-armed the burst
+        off a fresh sighting -- in which case the long quiet-gap timer already
+        armed is now the wrong one, and only re-deciding replaces it.
+        """
         self._refresh_online()
-        if self._retry_unsub is None:
-            self._maybe_upload()
+        self._maybe_upload()
 
     async def _async_upload(self) -> None:
         """One upload attempt for whatever the text says right now."""
@@ -453,6 +473,11 @@ class EPaperCoordinator:
                 if self._current() == (sending, gray4, rotation)
                 else STATUS_PENDING
             )
+            # Done, unless the text moved under us -- in which case the panel
+            # was awake a moment ago and a fresh burst is exactly right.
+            self._burst_until = (
+                None if self.status == STATUS_IDLE else time.monotonic() + BURST
+            )
             _LOGGER.debug("espaper %s: upload confirmed by the panel", self.address)
 
         self._notify()
@@ -461,7 +486,7 @@ class EPaperCoordinator:
         self._task = None
         # Whether this failed or the text was edited mid-upload, the panel is
         # asleep now -- it sleeps the moment it has rendered -- so both want the
-        # same thing: the next attempt aimed at the next wake.
+        # same thing: another attempt, as soon as the burst allows.
         self._maybe_upload()
 
     @callback

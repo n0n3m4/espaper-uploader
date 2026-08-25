@@ -40,15 +40,21 @@ integration actually owes the panel a frame. An update therefore lands within
 about one sleep cycle (~60 s by default), and a failed transfer simply retries on
 the next wake.
 
-Catching it means being early, not quick. Reacting to an advertisement is
-already too late — by the time it has reached Home Assistant and been noticed, a
-good part of the two seconds is gone. But a connect attempt is not an instant
-thing: the request stays *pending* for about twenty seconds, and the Bluetooth
-controller latches onto the panel's first advertisement in hardware. So the
-integration works out when the panel is next due — from the interval Home
-Assistant has learned for it, falling back to 62 s — and opens that twenty-second
-net a few seconds *before* the wake it is aiming at. One attempt per cycle,
-covering the window from both sides.
+Catching it means waiting, not reacting. An advertisement that has reached Home
+Assistant is already old news — a good part of the two seconds is gone by the
+time anything can act on it. But a connect attempt is not an instant thing: the
+request stays *pending* for about twenty seconds, and the Bluetooth controller
+latches onto the panel's first advertisement in hardware. So the integration
+simply holds a net open — arming the next attempt as each one expires, every two
+seconds — and lets the panel walk into it. There is no prediction of the next
+wake: the phase of the last sighting, the learned advertising interval and the
+panel's own clock all drift, and a mis-aimed net used to cost a full cycle.
+
+The nets run for two and a half minutes before pausing for one. That is not
+politeness for its own sake: while a connect is pending, a Bluetooth proxy is not
+scanning, so the advertisements that are the only evidence the panel still exists
+never arrive. The quiet gap is what keeps `online` honest — and if the panel is
+sighted during it, another burst starts.
 
 If the panel has not been heard from for five minutes it is treated as offline
 and attempts stop, leaving only the advertisement history being watched once a
@@ -365,8 +371,9 @@ Reading the state:
 
 | Symptom | Meaning |
 |---|---|
-| `next attempt in 34s` | Normal — that is the aim, a few seconds ahead of the panel's next wake. |
-| `upload failed: ...` then `next attempt in 54s` | Also normal: the net was open but the panel did not turn up in it. Expect the odd one. |
+| `next attempt in 2s` | Normal — the net is being held open, one twenty-second attempt after another, until the panel wakes into it. |
+| `upload failed: ...` then `next attempt in 2s` | Also normal: that net expired without the panel turning up. Expect a run of them. |
+| `next attempt in 60s (holding off)` | Two and a half minutes of attempts did not catch it, so the radio is being left alone for a minute — partly so the proxy can scan, and hear whether the panel is still there at all. |
 | `next attempt in 60s (panel offline)` | Nothing heard from the panel for five minutes: it is off, flat, out of range, or the adapter is down. The frame stays queued and goes out when it returns. |
 | `panel online` / `panel offline` | The connectivity sensor changing state. |
 | Nothing at all after setting text | The entity is not reaching the coordinator. Check the entity actually changed in *Developer Tools → States*. |
