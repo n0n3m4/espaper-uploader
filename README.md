@@ -113,10 +113,11 @@ underneath. Ctrl+Enter (⌘+Enter on a Mac) sends both. If you edit the text or
 the angle somewhere else while you have unsaved changes open, the card says so
 rather than overwriting what you typed.
 
-The integration serves the card itself, so there is no Lovelace resource to add
-and nothing extra to install. If it does not appear, hard-refresh the browser;
-failing that, add `/espaper/espaper-card.js` manually under **Settings →
-Dashboards → three-dot menu → Resources** as a JavaScript module.
+The integration serves the card and registers it as a Lovelace resource itself,
+so there is nothing extra to install and nothing to add by hand — it appears
+under **Settings → Dashboards → three-dot menu → Resources** on its own, and the
+entry there is rewritten, not duplicated, when the integration is upgraded. If
+the card does not appear, hard-refresh the browser.
 
 Options: `entity` (required), `title`, and `rows` (default 10).
 
@@ -374,7 +375,7 @@ Reading the state:
 | `state=ERROR err=BAD_GEOMETRY` | Firmware and renderer disagree on panel size — file a bug. |
 | `state=ERROR err=BAD_LENGTH` after turning on 4 colours | The firmware predates 2bpp or deflate. Flash the current build, or turn the switch off. |
 | `panel advertises 1 bpp, sending black and white` | Older firmware; harmless, and the switch stays on for when it is updated. |
-| The card is missing from the picker | Open `/espaper/espaper-card.js` in a browser tab. A 404 means the integration never registered it — the log says `dashboard card served at ...` on a good start, and warns if `www/espaper-card.js` is missing from the install. If it serves fine, it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
+| The card is missing from the picker, or shows `Configuration error` | The log says `dashboard card served at ... (Lovelace resource)` on a good start, and warns if `www/espaper-card.js` is missing from the install. The card should also be listed under **Settings → Dashboards → ⋮ → Resources**. If the log says `(extra JS URL)` instead, the dashboard is in YAML mode, and the card is loaded by a script tag that can lose the race on a cold page load — add `/espaper/espaper-card.js` to `lovelace: resources:` yourself. Otherwise it is the frontend cache: hard-refresh (Ctrl+Shift+R), or **Developer Tools → Application → Clear site data**. |
 | Stuck at `pending` forever | Look for the `next attempt in ...` lines. If they are absent, nothing is armed — that is a bug, please report it. |
 | Stuck at `uploading` forever | Should be impossible: every upload failure is caught and re-armed. If it happens, the log has a traceback — please report it. |
 
